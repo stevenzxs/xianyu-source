@@ -534,7 +534,12 @@ def _build_frontend():
         return True
 
     if not frontend_dir.exists():
-        print(f"{_WARN} frontend 目录不存在，跳过前端构建")
+        # 便携包/镜像默认不含 frontend 源码，前端已预先构建在 static/。
+        # 此时跳过构建是正常行为，不要输出「构建失败」吓到小白用户。
+        if (static_dir / "index.html").exists():
+            print(f"{_OK} 前端已打包在 static，跳过构建")
+            return True
+        print(f"{_WARN} frontend 目录与 static/index.html 均不存在，前端不可用")
         return False
 
     build_dir = frontend_dir
