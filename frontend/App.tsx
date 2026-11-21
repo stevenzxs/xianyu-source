@@ -2,6 +2,10 @@ import React, { Suspense, lazy, useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import GlobalFeedback from './components/GlobalFeedback';
 import AnnouncementBanner from './components/AnnouncementBanner';
+import ThemeToggle from './components/ThemeToggle';
+import CaptchaInput from './components/CaptchaInput';
+import { useCaptcha } from './lib/useCaptcha';
+import { validateEmail, validatePassword, validateUsername } from './lib/authValidation';
 import { login, verifyToken, getPublicSettings, register, sendVerificationCode } from './services/api';
 import { ShieldCheck, ArrowRight, Loader2, User, Lock, Menu, Mail, KeyRound, CheckCircle2 } from 'lucide-react';
 
@@ -16,6 +20,7 @@ const Settings = lazy(() => import('./components/Settings'));
 const Keywords = lazy(() => import('./components/Keywords'));
 const MessageManagement = lazy(() => import('./components/MessageManagement'));
 const NotificationsAndLogs = lazy(() => import('./components/NotificationsAndLogs'));
+const UserManagement = lazy(() => import('./components/UserManagement'));
 const About = lazy(() => import('./components/About'));
 const BuyerInteraction = lazy(() => import('./components/BuyerInteraction'));
 
@@ -39,8 +44,12 @@ const pageLabels: Record<string, string> = {
   'product-automation': '商品自动化',
   notifications: '通知与日志',
   settings: '系统设置',
+  users: '用户管理',
   about: '关于',
 };
+
+// 系统级页面仅管理员可用；普通用户 localStorage 里残留这些 tab 时切回总览
+const ADMIN_ONLY_TABS = ['settings', 'users'];
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -67,6 +76,15 @@ const App: React.FC = () => {
   const [codeSending, setCodeSending] = useState(false);
   const [codeCountdown, setCodeCountdown] = useState(0);
 
+  // 图形验证码：注册发码前必填；登录仅在连续失败被后端要求时出现
+  const regCaptcha = useCaptcha();
+  const loginCaptcha = useCaptcha();
+  // 切到注册页时拉一张新图（离开登录态图形码随 required 重置）
+  useEffect(() => {
+    if (authMode === 'register') void regCaptcha.refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authMode]);
+
   useEffect(() => {
     getPublicSettings()
       .then(s => {
@@ -88,20 +106,32 @@ const App: React.FC = () => {
       setRegError('请先填写邮箱');
       return;
     }
+    // 后端强制图形验证码通过后才会发邮箱码（防刷发件资源）
+    if (!regCaptcha.code.trim()) {
+      setRegError('请先输入图形验证码');
+      return;
+    }
     setCodeSending(true);
     setRegError('');
     setRegNotice('');
     try {
-      const res = await sendVerificationCode(regForm.email.trim(), 'register');
+      const res = await sendVerificationCode(regForm.email.trim(), 'register', {
+        session_id: regCaptcha.sessionId,
+        code: regCaptcha.code.trim(),
+      });
       if (res?.success === false) {
         // 多半是没配 SMTP，直接把后端原因透出来，省得对着"发送失败"猜
         setRegError(res.message || '验证码发送失败，请确认邮件服务已配置');
+        // 图形码一次性，无论成败都换新图
+        void regCaptcha.refresh();
         return;
       }
       setRegNotice('验证码已发送，请查收邮箱');
       setCodeCountdown(60);
+      void regCaptcha.refresh();
     } catch (err) {
       setRegError(err instanceof Error ? err.message : '验证码发送失败');
+      void regCaptcha.refresh();
     } finally {
       setCodeSending(false);
     }
@@ -112,9 +142,16 @@ const App: React.FC = () => {
     setRegError('');
     setRegNotice('');
 
-    if (regForm.password.length < 6) {
-      setRegError('密码至少 6 位');
-      return;
+    // 与后端同一套规则/文案（lib/authValidation.ts）
+    for (const [ok, reason] of [
+      validateUsername(regForm.username.trim()),
+      validateEmail(regForm.email.trim()),
+      validatePassword(regForm.password),
+    ]) {
+      if (!ok) {
+        setRegError(reason);
+        return;
+      }
     }
     if (needEmailCode && !regForm.code.trim()) {
       setRegError('请填写邮箱验证码');
@@ -159,6 +196,7 @@ const App: React.FC = () => {
                 return;
               }
               setIsAdmin(Boolean(result.is_admin));
+              setUsername(result.username || '');
               setIsLoggedIn(true);
             })
             .catch(() => localStorage.removeItem('auth_token'))
@@ -176,19 +214,39 @@ const App: React.FC = () => {
     localStorage.setItem('active_page', activeTab);
   }, [activeTab]);
 
+  // 普通用户不能停留在系统级页面（入口已隐藏，这里兜底清掉本地记忆的 tab）
+  useEffect(() => {
+    if (!isAdmin && ADMIN_ONLY_TABS.includes(activeTab)) setActiveTab('dashboard');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
+
   const handleLogin = async (e: React.FormEvent) => {
       e.preventDefault();
       setLoginLoading(true);
       setLoginError('');
       
       try {
-          const res = await login({ username, password });
+          // 连续失败被后端要求后，随请求带上图形验证码
+          const res = await login({
+              username,
+              password,
+              ...(loginCaptcha.required ? {
+                  captcha_session_id: loginCaptcha.sessionId,
+                  captcha_code: loginCaptcha.code.trim(),
+              } : {}),
+          });
           if (res.success && res.token) {
               localStorage.setItem('auth_token', res.token);
               setIsAdmin(Boolean(res.is_admin));
+              setUsername(res.username || username);
               setIsLoggedIn(true);
           } else {
               setLoginError(res.message || '账号或密码错误');
+              if (res.captcha_required) {
+                  // 触发防爆破：下一次登录必须先过图形验证
+                  loginCaptcha.setRequired(true);
+                  void loginCaptcha.refresh();
+              }
           }
       } catch (err) {
           setLoginError(err instanceof Error ? err.message : '登录失败，请稍后重试');
@@ -199,9 +257,9 @@ const App: React.FC = () => {
 
   if (checkingAuth) {
       return (
-          <div className="min-h-screen flex items-center justify-center bg-[#fffdf5]">
-              <div className="flex items-center gap-3 text-sm font-semibold text-gray-600">
-                <Loader2 className="h-5 w-5 animate-spin text-[#b29c00]" />
+          <div className="min-h-screen flex items-center justify-center bg-[var(--app-bg)]">
+              <div className="flex items-center gap-3 text-sm font-semibold text-[var(--text-muted)]">
+                <Loader2 className="h-5 w-5 animate-spin text-[var(--brand-text)]" />
                 正在验证登录状态
               </div>
           </div>
@@ -211,13 +269,14 @@ const App: React.FC = () => {
   // Login Screen Component
   if (!isLoggedIn) {
     return (
-      <div className="min-h-screen bg-[#fffdf5] p-4 font-sans sm:p-6">
+      <div className="relative min-h-screen bg-[var(--app-bg)] p-4 font-sans text-[var(--text)] sm:p-6">
+        <ThemeToggle compact className="absolute right-4 top-4 z-10 sm:right-6 sm:top-6" />
         <div className="mx-auto flex min-h-[calc(100vh-2rem)] max-w-5xl items-center justify-center sm:min-h-[calc(100vh-3rem)]">
-          <div className="grid w-full overflow-hidden rounded-3xl bg-white lg:grid-cols-[1.05fr_0.95fr]"
+          <div className="grid w-full overflow-hidden rounded-3xl bg-[var(--surface)] lg:grid-cols-[1.05fr_0.95fr]"
                style={{ border: '1px solid var(--border)', boxShadow: 'var(--shadow-lg)' }}>
             {/* 品牌侧：黄色渐变作为整站第一印象 */}
             <div
-              className="hidden min-h-[560px] flex-col justify-between p-10 lg:flex"
+              className="theme-brand-panel hidden min-h-[560px] flex-col justify-between p-10 lg:flex"
               style={{ background: 'linear-gradient(155deg, #fff8d1 0%, #ffe566 55%, #ffe100 100%)' }}
             >
               <div>
@@ -297,6 +356,14 @@ const App: React.FC = () => {
                             />
                           </div>
                       </label>
+                      {loginCaptcha.required && (
+                          <CaptchaInput
+                              image={loginCaptcha.image}
+                              code={loginCaptcha.code}
+                              onCodeChange={loginCaptcha.setCode}
+                              onRefresh={() => void loginCaptcha.refresh()}
+                          />
+                      )}
                   </div>
 
                   {loginNotice && (
@@ -360,7 +427,7 @@ const App: React.FC = () => {
                             <Lock className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400 group-focus-within:text-gray-700" />
                             <input
                                 type="password"
-                                placeholder="至少 6 位"
+                                placeholder="至少 8 位，含字母和数字"
                                 value={regForm.password}
                                 onChange={e => setRegForm({ ...regForm, password: e.target.value })}
                                 autoComplete="new-password"
@@ -370,6 +437,13 @@ const App: React.FC = () => {
                           </div>
                       </label>
                       {needEmailCode && (
+                      <>
+                      <CaptchaInput
+                          image={regCaptcha.image}
+                          code={regCaptcha.code}
+                          onCodeChange={regCaptcha.setCode}
+                          onRefresh={() => void regCaptcha.refresh()}
+                      />
                       <label className="block">
                           <span className="mb-1.5 block text-xs font-bold text-gray-600">邮箱验证码</span>
                           <div className="flex gap-2">
@@ -393,6 +467,7 @@ const App: React.FC = () => {
                             </button>
                           </div>
                       </label>
+                      </>
                       )}
                   </div>
 
@@ -425,7 +500,7 @@ const App: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => { setAuthMode('register'); setLoginError(''); setLoginNotice(''); }}
-                          className="ml-1 font-bold text-[#8c7900] hover:underline"
+                          className="ml-1 font-bold text-[var(--brand-text)] hover:underline"
                         >
                           注册新账号
                         </button>
@@ -435,7 +510,7 @@ const App: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => { setAuthMode('login'); setRegError(''); setRegNotice(''); }}
-                          className="ml-1 font-bold text-[#8c7900] hover:underline"
+                          className="ml-1 font-bold text-[var(--brand-text)] hover:underline"
                         >
                           返回登录
                         </button>
@@ -445,7 +520,7 @@ const App: React.FC = () => {
                 )}
 
                 <p className="mt-7 border-t border-gray-100 pt-5 text-xs font-medium text-gray-400">
-                  闲鱼超级管家 · Management Console
+                  闲鱼超级管家 · xy.corleom.com
                 </p>
               </div>
             </div>
@@ -456,7 +531,7 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="flex min-h-screen bg-[#fffdf5] text-[#2a2416]">
+    <div className="flex min-h-screen bg-[var(--app-bg)] text-[var(--text)]">
       <GlobalFeedback />
       <Sidebar 
         activeTab={activeTab} 
@@ -466,6 +541,9 @@ const App: React.FC = () => {
         }}
         mobileOpen={mobileMenuOpen}
         onMobileClose={() => setMobileMenuOpen(false)}
+        isAdmin={isAdmin}
+        username={isLoggedIn ? username : ''}
+        onUsernameChange={setUsername}
         onLogout={() => {
             localStorage.removeItem('auth_token');
             setIsAdmin(false);
@@ -474,7 +552,7 @@ const App: React.FC = () => {
       />
       
       <main className="min-h-screen min-w-0 flex-1 overflow-y-auto lg:ml-[248px]">
-        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-[#f0e6c8] bg-white px-4 lg:hidden">
+        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-4 lg:hidden">
           <button
             type="button"
             onClick={() => setMobileMenuOpen(true)}
@@ -488,6 +566,7 @@ const App: React.FC = () => {
             <p className="truncate text-sm font-bold">{pageLabels[activeTab] || '闲鱼超级管家'}</p>
             <p className="text-[11px] text-gray-400">闲鱼超级管家</p>
           </div>
+          <ThemeToggle compact className="ml-auto" />
         </header>
         {activeTab !== 'messages' && <AnnouncementBanner />}
         <div className={
@@ -529,9 +608,17 @@ const App: React.FC = () => {
               <NotificationsAndLogs isAdmin={isAdmin} />
             </Suspense>
           </section>
-          <section hidden={activeTab !== 'settings'}>
-            <Suspense fallback={activeTab === 'settings' ? <PageLoader /> : null}><Settings /></Suspense>
-          </section>
+          {isAdmin && (
+            <section hidden={activeTab !== 'users'}>
+              <Suspense fallback={activeTab === 'users' ? <PageLoader /> : null}><UserManagement /></Suspense>
+            </section>
+          )}
+          {/* 系统设置页面含 SMTP/注册开关等系统级配置，普通用户不挂载（后端接口同样只放行业务白名单） */}
+          {isAdmin && (
+            <section hidden={activeTab !== 'settings'}>
+              <Suspense fallback={activeTab === 'settings' ? <PageLoader /> : null}><Settings /></Suspense>
+            </section>
+          )}
           <section hidden={activeTab !== 'buyer-interaction'}>
             <Suspense fallback={activeTab === 'buyer-interaction' ? <PageLoader /> : null}><BuyerInteraction /></Suspense>
           </section>

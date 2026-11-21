@@ -26,6 +26,7 @@ from collections import defaultdict
 from app.db_manager import db_manager
 from app.specification import combine_legacy_specification
 from utils.log_sanitizer import redact_log_record, redact_sensitive_text
+from utils.user_agents import CHROME_UA, SEC_CH_UA
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -201,6 +202,8 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
+    _password_login_fail_threshold = 3  # 连续失败达到此次数后进入人工重登终态
+    _relogin_cooldown_seconds = 30 * 60  # 进入人工重登终态后的冷却时间：30分钟
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -233,6 +236,126 @@ class XianyuLive:
                 logger.success(state_msg)
             else:
                 logger.info(state_msg)
+
+    def _is_relogin_terminal(self) -> bool:
+        """判断账号是否已经进入需要人工重新登录的终态。"""
+        return bool(getattr(self, "needs_relogin", False))
+
+    def _relogin_cooldown_remaining(self) -> float:
+        """返回人工重新登录终态的剩余冷却秒数。"""
+        return max(
+            0.0,
+            float(getattr(self, "relogin_terminal_until", 0.0) or 0.0)
+            - time.time(),
+        )
+
+    def _mark_relogin_required(self, reason: str, terminal: bool = True) -> bool:
+        """标记账号需要人工重新登录，并阻止自动重试风暴。
+
+        Returns:
+            bool: 本次是否第一次进入该终态。
+        """
+        was_marked = self._is_relogin_terminal()
+        self.needs_relogin = True
+        self.relogin_reason = reason or "闲鱼登录态已失效，请重新扫码登录"
+        if terminal:
+            cooldown_until = time.time() + self._relogin_cooldown_seconds
+            self.relogin_terminal_until = max(
+                float(getattr(self, "relogin_terminal_until", 0.0) or 0.0),
+                cooldown_until,
+            )
+        self.last_token_refresh_status = "relogin_required"
+        self._set_connection_state(
+            ConnectionState.FAILED,
+            self.relogin_reason,
+        )
+        if not was_marked:
+            logger.error(
+                f"【{self.cookie_id}】已进入人工重新登录终态："
+                f"{self.relogin_reason}；冷却 {self._relogin_cooldown_seconds // 60:.0f} 分钟"
+            )
+        return not was_marked
+
+    def _clear_relogin_required(self) -> None:
+        """清除人工重新登录终态，允许连接和后台任务恢复。"""
+        was_marked = self._is_relogin_terminal()
+        self.needs_relogin = False
+        self.relogin_reason = ''
+        self.relogin_terminal_until = 0.0
+        self.password_login_failures = 0
+        self._relogin_notification_sent = False
+        self.connection_failures = 0
+        if was_marked:
+            logger.info(f"【{self.cookie_id}】人工登录已完成，清除重新登录终态")
+
+    def _record_password_login_failure(self, reason: str) -> bool:
+        """记录一次自动密码登录失败，达到阈值后进入人工重登终态。"""
+        self.password_login_failures += 1
+        logger.warning(
+            f"【{self.cookie_id}】自动密码登录失败 "
+            f"({self.password_login_failures}/{self._password_login_fail_threshold})：{reason}"
+        )
+        if self.password_login_failures >= self._password_login_fail_threshold:
+            return self._mark_relogin_required(
+                f"自动密码登录连续失败 {self.password_login_failures} 次，"
+                "请重新扫码登录",
+                terminal=True,
+            )
+        return False
+
+    async def _notify_relogin_required(self) -> None:
+        """只发送一次人工重新登录通知，避免重连循环刷屏。"""
+        if getattr(self, "_relogin_notification_sent", False):
+            return
+        self._relogin_notification_sent = True
+        try:
+            await self.send_token_refresh_notification(
+                self.relogin_reason or "闲鱼登录态已失效，请重新扫码登录",
+                "relogin_required",
+            )
+        except Exception as notify_error:
+            logger.warning(
+                f"【{self.cookie_id}】发送重新登录通知失败："
+                f"{self._safe_str(notify_error)}"
+            )
+
+    async def _hold_relogin_terminal(self) -> None:
+        """停在人工重登状态，等待扫码/人工验证成功后恢复。"""
+        if not self._is_relogin_terminal():
+            return
+
+        self._set_connection_state(
+            ConnectionState.FAILED,
+            self.relogin_reason or "等待人工重新登录",
+        )
+        if self.ws:
+            try:
+                if not getattr(self.ws, "closed", False):
+                    await asyncio.wait_for(self.ws.close(), timeout=2.0)
+            except Exception:
+                pass
+            finally:
+                self.ws = None
+
+        # 终态期间不保留心跳、Token/Cookie 刷新及业务同步任务。
+        await self._cancel_background_tasks()
+        last_log_time = 0.0
+        while self._is_relogin_terminal():
+            now = time.time()
+            if now - last_log_time >= 60:
+                remaining = self._relogin_cooldown_remaining()
+                logger.warning(
+                    f"【{self.cookie_id}】等待人工重新登录，"
+                    f"冷却剩余 {remaining:.0f} 秒；请扫码或完成人工验证后恢复"
+                )
+                last_log_time = now
+            await self._interruptible_sleep(5)
+
+        self.connection_failures = 0
+        self._set_connection_state(
+            ConnectionState.DISCONNECTED,
+            "人工登录完成，准备恢复连接",
+        )
 
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep，将长时间sleep拆分成多个短时间sleep，以便及时响应取消信号
@@ -850,6 +973,7 @@ class XianyuLive:
         # 滑块验证相关
         self.captcha_verification_count = 0  # 滑块验证次数计数器
         self.max_captcha_verification_count = 3  # 最大滑块验证次数，防止无限递归
+        self.manual_captcha_in_progress = False  # 人工滑块验证进行中标志，暂停自动验证避免争抢浏览器槽位
 
         # WebSocket连接监控
         self.connection_state = ConnectionState.DISCONNECTED  # 连接状态
@@ -1018,10 +1142,7 @@ class XianyuLive:
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://www.goofish.com',
             'referer': 'https://www.goofish.com/',
-            'user-agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36'
-            ),
+            'user-agent': CHROME_UA,
             'cookie': self.cookies_str.replace('\n', '').replace('\r', ''),
         }
 
@@ -1102,10 +1223,7 @@ class XianyuLive:
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://seller.goofish.com',
             'referer': 'https://seller.goofish.com/',
-            'user-agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36'
-            ),
+            'user-agent': CHROME_UA,
             'cookie': self.cookies_str.replace('\n', '').replace('\r', ''),
         }
 
@@ -1470,6 +1588,15 @@ class XianyuLive:
                 except Exception as parse_e:
                     logger.warning(f"解析dynamicOperation JSON失败: {parse_e}")
 
+            # 方法2.5: 从 message['3'] 中直接提取 orderId
+            if not order_id:
+                message_3 = message.get('3')
+                if isinstance(message_3, dict):
+                    direct_order_id = message_3.get('orderId')
+                    if direct_order_id and str(direct_order_id).isdigit():
+                        order_id = str(direct_order_id)
+                        logger.info(f'【{self.cookie_id}】✅ 从message[3].orderId提取到订单ID: {order_id}')
+
             # 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
             if not order_id:
                 try:
@@ -1478,10 +1605,10 @@ class XianyuLive:
 
                     # 搜索各种可能的订单ID模式
                     patterns = [
-                        r'orderId[=:](\d{10,})',  # orderId=123456789 或 orderId:123456789
+                        r'orderId["\']?\s*[:=]\s*["\']?(\d{10,})',  # orderId: '123' 或 orderId=123
                         r'order_detail\?id=(\d{10,})',  # order_detail?id=123456789
                         r'"id"\s*:\s*"?(\d{10,})"?',  # "id":"123456789" 或 "id":123456789
-                        r'bizOrderId[=:](\d{10,})',  # bizOrderId=123456789
+                        r'bizOrderId["\']?\s*[:=]\s*["\']?(\d{10,})',  # bizOrderId=123456789
                     ]
 
                     for pattern in patterns:
@@ -1580,6 +1707,8 @@ class XianyuLive:
             receiver_name = None
             receiver_phone = None
             receiver_address = None
+            real_buyer_id = None
+            real_item_title = None
             real_values = self._pending_order_real_values.pop(order_id, None)
             if real_values:
                 amount = real_values.get("amount") or None
@@ -1591,15 +1720,22 @@ class XianyuLive:
                 receiver_name = real_values.get("receiver_name") or None
                 receiver_phone = real_values.get("receiver_phone") or None
                 receiver_address = real_values.get("receiver_address") or None
+                real_buyer_id = real_values.get("buyer_id") or None
+                real_item_title = real_values.get("item_title") or None
 
             existing_order = db_manager.get_order_by_id(order_id)
             snapshot_item_id = item_id
-            snapshot_buyer_id = buyer_id
+            snapshot_buyer_id = real_buyer_id or buyer_id
             snapshot_quantity = str(buy_num) if buy_num else None
             snapshot_created_at = created_at
             if existing_order:
                 snapshot_item_id = item_id if not existing_order.get("item_id") else None
-                snapshot_buyer_id = buyer_id if not existing_order.get("buyer_id") else None
+                existing_buyer_id = (existing_order.get("buyer_id") or "").strip()
+                if real_buyer_id and (not existing_buyer_id or existing_buyer_id == "unknown_user"):
+                    # 卖家端真实数据可纠正快照兜底写入的 unknown_user
+                    snapshot_buyer_id = real_buyer_id
+                elif existing_buyer_id:
+                    snapshot_buyer_id = None
                 snapshot_created_at = created_at if not existing_order.get("created_at") else None
 
             saved = db_manager.insert_or_update_order(
@@ -1622,6 +1758,12 @@ class XianyuLive:
                 receiver_address=receiver_address,
             )
             if saved:
+                # 商品标题只从卖家端来，交易卡片里没有；回填 item_info 供订单列表展示
+                if item_id and real_item_title:
+                    try:
+                        db_manager.upsert_item_title(self.cookie_id, item_id, real_item_title)
+                    except Exception as title_err:
+                        logger.debug(f"【{self.cookie_id}】回填商品标题失败 {item_id}: {self._safe_str(title_err)}")
                 source = "卖家端接口" if real_values else "交易卡片"
                 logger.info(
                     f"【{self.cookie_id}】已保存订单快照（金额来源: {source}）: "
@@ -2077,6 +2219,14 @@ class XianyuLive:
                 self.last_token_refresh_status = "risk_control_blocked"
                 return None
 
+            # 人工验证进行中时跳过自动 Token 刷新 —— 自动滑块和人工验证共用
+            # browser_limit 全局信号量（默认 3 槽位），自动滑块占满槽位后人工验证
+            # 会在 launch_browser 里等 300 秒超时，前端弹窗卡在白屏 loading。
+            if getattr(self, 'manual_captcha_in_progress', False):
+                logger.info(f"【{self.cookie_id}】人工滑块验证进行中，跳过本次自动 Token 刷新")
+                self.last_token_refresh_status = "skipped_manual_captcha"
+                return None
+
             # 检查滑块验证重试次数，防止无限递归
             if captcha_retry_count >= self.max_captcha_verification_count:
                 logger.error(f"【{self.cookie_id}】滑块验证重试次数已达上限 ({self.max_captcha_verification_count})，停止重试")
@@ -2166,13 +2316,13 @@ class XianyuLive:
                 'content-type': 'application/x-www-form-urlencoded',
                 'pragma': 'no-cache',
                 'priority': 'u=1, i',
-                'sec-ch-ua': '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+                'sec-ch-ua': SEC_CH_UA,
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"',
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'same-site',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+                'user-agent': CHROME_UA,
                 'referer': 'https://www.goofish.com/',
                 'origin': 'https://www.goofish.com',
                 'cookie': self.cookies_str
@@ -3782,11 +3932,7 @@ class XianyuLive:
             browser = await browser_limit.launch_browser(playwright, launch_options, "账号资料抓取")
             context = await browser.new_context(
                 viewport={'width': 1440, 'height': 900},
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/138.0.0.0 Safari/537.36'
-                ),
+                user_agent=CHROME_UA,
             )
 
             browser_cookies = []
@@ -3936,7 +4082,7 @@ class XianyuLive:
             # 创建浏览器上下文
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                user_agent=CHROME_UA
             )
 
             # 设置Cookie
@@ -4621,7 +4767,7 @@ class XianyuLive:
             
             # 不接受AVIF格式（PIL默认不支持），让CDN返回WEBP/JPEG等格式
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': CHROME_UA,
                 'Accept': 'image/jpeg,image/png,image/gif,image/webp,*/*;q=0.8',
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                 'Referer': 'https://www.goofish.com/',
@@ -8071,7 +8217,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                'user_agent': CHROME_UA
             }
 
             # 使用标准窗口大小
@@ -8407,7 +8553,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                'user_agent': CHROME_UA
             }
 
             # 使用标准窗口大小
@@ -8714,7 +8860,7 @@ class XianyuLive:
 
             # 创建浏览器上下文
             context_options = {
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+                'user_agent': CHROME_UA
             }
 
             # 使用标准窗口大小
@@ -9034,7 +9180,7 @@ class XianyuLive:
             "Connection": "Upgrade",
             "Pragma": "no-cache",
             "Cache-Control": "no-cache",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "User-Agent": CHROME_UA,
             "Origin": "https://www.goofish.com",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9",

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  BellRing,
   Image,
   Inbox,
   Loader2,
@@ -26,6 +27,7 @@ import {
   MessageFilterType,
   QuickPhrase,
 } from '../types';
+import { renderRichText } from '../lib/emojiMap';
 import {
   batchCreateMessageFilters,
   batchDeleteMessageFilters,
@@ -51,6 +53,68 @@ type MobilePane = 'list' | 'chat';
 // 打到限流（429 flow controled）；聊天场景 10 秒的延迟是可接受的。
 const CONVERSATION_POLL_MS = 10000;
 const MESSAGE_POLL_MS = 10000;
+const READ_WATERMARKS_STORAGE_KEY = 'xianyu-message-read-watermarks-v2';
+const MAX_READ_WATERMARKS = 500;
+
+type ReadWatermark = {
+  lastMessageTime: number;
+  lastMessageSummary: string;
+  unreadCount: number;
+};
+
+type ReadWatermarks = Record<string, ReadWatermark>;
+
+const readWatermarkKey = (accountId: string, cid: string) => `${accountId}\u0000${cid}`;
+
+const loadReadWatermarks = (): ReadWatermarks => {
+  if (typeof window === 'undefined') return {};
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(READ_WATERMARKS_STORAGE_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        const watermark = value as Partial<ReadWatermark>;
+        return Number.isFinite(watermark.lastMessageTime)
+          && typeof watermark.lastMessageSummary === 'string'
+          && Number.isFinite(watermark.unreadCount);
+      })
+    ) as ReadWatermarks;
+  } catch {
+    return {};
+  }
+};
+
+const saveReadWatermarks = (watermarks: ReadWatermarks) => {
+  if (typeof window === 'undefined') return;
+  try {
+    const recentEntries = Object.entries(watermarks)
+      .sort(([, left], [, right]) => right.lastMessageTime - left.lastMessageTime)
+      .slice(0, MAX_READ_WATERMARKS);
+    window.localStorage.setItem(
+      READ_WATERMARKS_STORAGE_KEY,
+      JSON.stringify(Object.fromEntries(recentEntries))
+    );
+  } catch {
+    // 隐私模式或存储空间不足时，仍保留当前页面内的已读状态。
+  }
+};
+
+const isCoveredByReadWatermark = (
+  watermark: ReadWatermark | undefined,
+  conversation: ChatConversation
+) => {
+  if (!watermark) return false;
+  const lastMessageTime = Number(conversation.lastMessageTime) || 0;
+  const lastMessageSummary = String(conversation.lastMessageSummary || '');
+  const unreadCount = Number(conversation.unreadCount) || 0;
+  return lastMessageTime < watermark.lastMessageTime
+    || (
+      lastMessageTime === watermark.lastMessageTime
+      && lastMessageSummary === watermark.lastMessageSummary
+      && unreadCount <= watermark.unreadCount
+    );
+};
 
 interface MessageManagementProps {
   isActive?: boolean;
@@ -75,7 +139,7 @@ const formatTimestamp = (value?: number) => {
 
 const formatDateTime = (value?: string) => {
   if (!value) return '-';
-  const date = new Date(value.includes('T') ? value : value.replace(' ', 'T'));
+  const date = new Date(value.includes('T') ? value : `${value.replace(' ', 'T')}Z`);
   return Number.isNaN(date.getTime())
     ? value
     : date.toLocaleString('zh-CN', {
@@ -88,6 +152,21 @@ const formatDateTime = (value?: string) => {
 
 const accountName = (account?: ChatAccount) =>
   account?.displayName || account?.accountId || '未选择账号';
+
+// 买家占位头像的色板：与站点主题协调。按用户 ID 哈希取色，
+// 同一买家在会话列表和聊天气泡里、每次刷新都是同一颜色。
+const AVATAR_PALETTE = [
+  '#8c7900', '#0f704b', '#2a5f92', '#945800',
+  '#6b5a8a', '#b45309', '#3f7a5c', '#7c4d5e',
+];
+
+const avatarColorFor = (seed: string) => {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) | 0;
+  }
+  return AVATAR_PALETTE[Math.abs(hash) % AVATAR_PALETTE.length];
+};
 
 const filterTypeLabel: Record<MessageFilterType, string> = {
   skip_reply: '跳过自动回复',
@@ -107,6 +186,10 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   const [activeCid, setActiveCid] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [query, setQuery] = useState('');
+  const [searchInputUnlocked, setSearchInputUnlocked] = useState(false);
+  const [searchInputName] = useState(
+    () => `conversation-filter-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
   const [accountsLoading, setAccountsLoading] = useState(true);
   const [conversationsLoading, setConversationsLoading] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -116,6 +199,10 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   const [showPhrases, setShowPhrases] = useState(false);
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchInputTouchedRef = useRef(false);
+  const activeCidRef = useRef('');
+  const readWatermarksRef = useRef<ReadWatermarks>(loadReadWatermarks());
 
   const [filters, setFilters] = useState<MessageFilter[]>([]);
   const [filtersLoading, setFiltersLoading] = useState(true);
@@ -156,6 +243,42 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   const selectedAllFilters = filters.length > 0
     && filters.every((filter) => selectedFilterIds.includes(filter.id));
 
+  const rememberConversationRead = (conversation: ChatConversation) => {
+    if (!activeAccountId || !conversation.cid) return;
+    const key = readWatermarkKey(activeAccountId, conversation.cid);
+    const nextWatermark: ReadWatermark = {
+      lastMessageTime: Number(conversation.lastMessageTime) || 0,
+      lastMessageSummary: String(conversation.lastMessageSummary || ''),
+      unreadCount: Number(conversation.unreadCount) || 0,
+    };
+    const previous = readWatermarksRef.current[key];
+    if (
+      previous
+      && (
+        previous.lastMessageTime > nextWatermark.lastMessageTime
+        || (
+          previous.lastMessageTime === nextWatermark.lastMessageTime
+          && previous.lastMessageSummary === nextWatermark.lastMessageSummary
+          && previous.unreadCount >= nextWatermark.unreadCount
+        )
+      )
+    ) {
+      return;
+    }
+    readWatermarksRef.current[key] = nextWatermark;
+    saveReadWatermarks(readWatermarksRef.current);
+  };
+
+  const openConversation = (conversation: ChatConversation) => {
+    rememberConversationRead(conversation);
+    activeCidRef.current = conversation.cid;
+    setConversations((current) => current.map((item) => (
+      item.cid === conversation.cid ? { ...item, unreadCount: 0 } : item
+    )));
+    setActiveCid(conversation.cid);
+    setMobilePane('chat');
+  };
+
   const loadAccounts = async () => {
     setAccountsLoading(true);
     try {
@@ -180,15 +303,36 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
     if (!silent) setConversationsLoading(true);
     try {
       const result = await getChatConversations(activeAccountId);
-      setConversations(result.conversations || []);
+      const incoming = result.conversations || [];
+      const currentCid = activeCidRef.current;
+      const nextCid = incoming.some((conversation) => conversation.cid === currentCid)
+        ? currentCid
+        : incoming[0]?.cid || '';
+      const normalized = incoming.map((conversation) => {
+        const isOpen = isActive
+          && conversation.cid === nextCid
+          && (
+            mobilePane === 'chat'
+            || window.matchMedia('(min-width: 1024px)').matches
+          );
+        const watermark = readWatermarksRef.current[
+          readWatermarkKey(activeAccountId, conversation.cid)
+        ];
+        if (isOpen) rememberConversationRead(conversation);
+        return isOpen || isCoveredByReadWatermark(watermark, conversation)
+          ? { ...conversation, unreadCount: 0 }
+          : conversation;
+      });
+      setConversations(normalized);
       setActiveCid((current) => {
         // 用户已经选了会话就不要动它。会话列表是定时刷新的，一旦某次刷新
         // 因限流或数据不全而没带上当前会话，这里就会把用户强行切回第一条 ——
         // 表现为「点第二个及之后的对话，消息区一片空白」。
-        if (current) {
-          return current;
-        }
-        return result.conversations[0]?.cid || '';
+        const next = current && incoming.some((conversation) => conversation.cid === current)
+          ? current
+          : incoming[0]?.cid || '';
+        activeCidRef.current = next;
+        return next;
       });
     } catch (error) {
       if (!silent) notify(`加载会话失败：${(error as Error).message}`, 'error');
@@ -248,6 +392,7 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   }, []);
 
   useEffect(() => {
+    activeCidRef.current = '';
     setActiveCid('');
     setMessages([]);
     setMobilePane('list');
@@ -265,7 +410,7 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
     // 多开几个标签页就会把账号打到 429（flow controled），表现为消息加载失败。
     const timer = window.setInterval(() => void loadConversations(true), CONVERSATION_POLL_MS);
     return () => window.clearInterval(timer);
-  }, [isActive, view, activeAccountId]);
+  }, [isActive, view, activeAccountId, mobilePane]);
 
   useEffect(() => {
     if (!isActive || view !== 'messages' || !activeAccountId || !activeCid) return undefined;
@@ -277,6 +422,22 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    // Chromium 和部分密码管理器会无视 autocomplete="off"，把本站保存的
+    // 管理员用户名灌进页面上的第一个文本框。只清理用户尚未触碰过的值，
+    // 避免定时器误删用户真正输入的搜索词。
+    const clearUnexpectedAutofill = () => {
+      if (searchInputTouchedRef.current || !searchInputRef.current) return;
+      searchInputRef.current.value = '';
+      setQuery('');
+    };
+    clearUnexpectedAutofill();
+    const timers = [100, 500, 1500].map((delay) => (
+      window.setTimeout(clearUnexpectedAutofill, delay)
+    ));
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, []);
 
   useEffect(() => {
     getQuickPhrases()
@@ -360,15 +521,18 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
     }
   };
 
-  const renderAvatar = (url: string | undefined, label: string, className: string) => {
+  const renderAvatar = (url: string | undefined, label: string, className: string, seed?: string) => {
     const normalized = normalizeImageUrl(url);
     const placeholder = (
-      <div className={`${className} flex items-center justify-center bg-[#3a3427] text-sm font-bold text-white`}>
+      <div
+        className={`${className} flex items-center justify-center text-sm font-bold text-white`}
+        style={{ backgroundColor: avatarColorFor(String(seed || label || '').trim()) }}
+      >
         {label.trim().slice(0, 1) || <UserRound className="h-4 w-4" />}
       </div>
     );
-    // 买家头像由 DiceBear 生成，属于外部服务；加载不出来时回落到首字母，
-    // 而不是让列表挂一排破图。
+    // 平台真给了头像（alicdn）就直连；加载失败时回落到本地彩色首字母，
+    // 不再依赖 DiceBear 之类的外部生成服务——国内连不通只会得到一片灰块。
     return normalized && !failedAvatars.has(normalized) ? (
       <img
         src={normalized}
@@ -384,14 +548,14 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   };
 
   const renderMessages = () => (
-    <div className="grid h-full min-h-0 overflow-hidden bg-white lg:grid-cols-[356px_minmax(0,1fr)]">
-      <aside className={`${mobilePane === 'chat' ? 'hidden lg:flex' : 'flex'} min-h-0 flex-col border-b border-[#f0e6c8] lg:border-b-0 lg:border-r`}>
-        <div className="flex h-[68px] shrink-0 items-center gap-3 border-b border-[#f0e6c8] px-4">
+    <div className="grid h-full min-h-0 overflow-hidden bg-[var(--surface)] lg:grid-cols-[356px_minmax(0,1fr)]">
+      <aside className={`${mobilePane === 'chat' ? 'hidden lg:flex' : 'flex'} min-h-0 flex-col border-b border-[var(--border)] lg:border-b-0 lg:border-r`}>
+        <div className="flex h-[68px] shrink-0 items-center gap-3 border-b border-[var(--border)] px-4">
           <select
             value={activeAccountId}
             onChange={(event) => setActiveAccountId(event.target.value)}
             aria-label="消息账号"
-            className="h-10 min-w-0 flex-1 rounded-md border border-[#e6d69a] bg-white px-3 text-sm font-bold outline-none focus:border-[#e6c600]"
+            className="h-10 min-w-0 flex-1 rounded-md border border-[var(--border-strong)] bg-[var(--surface)] px-3 text-sm font-bold text-[var(--text)] outline-none focus:border-[var(--brand)]"
           >
             {accounts.length === 0 && <option value="">暂无账号</option>}
             {accounts.map((account) => (
@@ -404,7 +568,7 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
             type="button"
             onClick={() => void Promise.all([loadAccounts(), loadConversations()])}
             title="刷新账号和会话"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full hover:bg-[#fff9e8]"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full hover:bg-[var(--surface-hover)]"
           >
             <RefreshCw className={`h-4 w-4 ${
               accountsLoading || conversationsLoading ? 'animate-spin' : ''
@@ -414,20 +578,46 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
             type="button"
             onClick={() => setView('filters')}
             title="消息过滤规则"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full hover:bg-[#fff9e8]"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full hover:bg-[var(--surface-hover)]"
           >
             <Settings2 className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="border-b border-[#f0e6c8] p-3">
+        <div className="border-b border-[var(--border)] p-3">
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#aaa]" />
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-soft)]" />
             <input
+              ref={searchInputRef}
+              type="search"
+              name={searchInputName}
+              autoComplete="new-password"
+              autoCorrect="off"
+              spellCheck={false}
+              aria-label="搜索联系人、商品或消息"
+              data-lpignore="true"
+              data-1p-ignore="true"
+              data-bwignore="true"
+              readOnly={!searchInputUnlocked}
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onFocus={() => {
+                searchInputTouchedRef.current = true;
+                setSearchInputUnlocked(true);
+              }}
+              onBlur={() => {
+                searchInputTouchedRef.current = false;
+                setSearchInputUnlocked(false);
+              }}
+              onChange={(event) => {
+                if (!searchInputTouchedRef.current) {
+                  event.currentTarget.value = '';
+                  setQuery('');
+                  return;
+                }
+                setQuery(event.target.value);
+              }}
               placeholder="搜索联系人、商品或消息"
-              className="h-9 w-full rounded-md bg-[#fff9e8] pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-[#ffe100]"
+              className="h-9 w-full rounded-md bg-[var(--surface-subtle)] pl-9 pr-3 text-sm text-[var(--text)] outline-none placeholder:text-[var(--text-soft)] focus:ring-2 focus:ring-[var(--brand)]"
             />
           </div>
         </div>
@@ -445,32 +635,29 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
               <button
                 key={conversation.cid}
                 type="button"
-                onClick={() => {
-                  setActiveCid(conversation.cid);
-                  setMobilePane('chat');
-                }}
+                onClick={() => openConversation(conversation)}
                 className={`grid w-full grid-cols-[48px_minmax(0,1fr)_auto] gap-3 px-4 py-3 text-left ${
-                  selected ? 'bg-[#f5edd6]' : 'hover:bg-[#fffdf5]'
+                  selected ? 'bg-[var(--surface-strong)]' : 'hover:bg-[var(--surface-hover)]'
                 }`}
               >
-                {renderAvatar(conversation.otherUserAvatar, title, 'h-12 w-12 rounded-full')}
+                {renderAvatar(conversation.otherUserAvatar, title, 'h-12 w-12 rounded-full', conversation.otherUserId)}
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <p className="truncate text-sm font-bold text-[#2a2416]">{title}</p>
+                    <p className="truncate text-sm font-bold text-[var(--text)]">{title}</p>
                     {conversation.unreadCount > 0 && (
-                      <span className="min-w-5 rounded-full bg-[#ff4d4f] px-1.5 text-center text-[10px] leading-5 text-white">
+                      <span className="min-w-5 rounded-full bg-[var(--unread-badge)] px-1.5 text-center text-[10px] leading-5 text-white">
                         {conversation.unreadCount > 99 ? '99+' : conversation.unreadCount}
                       </span>
                     )}
                   </div>
-                  <p className="mt-1 truncate text-xs text-[#777]">
-                    {conversation.lastMessageSummary || '暂无消息'}
+                  <p className="mt-1 truncate text-xs text-[var(--text-muted)]">
+                    {conversation.lastMessageSummary ? renderRichText(conversation.lastMessageSummary) : '暂无消息'}
                   </p>
-                  <p className="mt-1 truncate text-[10px] text-[#aaa]">
+                  <p className="mt-1 truncate text-[10px] text-[var(--text-soft)]">
                     {conversation.itemTitle || (conversation.itemId ? `商品 ${conversation.itemId}` : '普通会话')}
                   </p>
                 </div>
-                <span className="pt-0.5 text-[10px] text-[#aaa]">
+                <span className="pt-0.5 text-[10px] text-[var(--text-soft)]">
                   {formatTimestamp(conversation.lastMessageTime)}
                 </span>
               </button>
@@ -478,8 +665,8 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
           })}
           {!conversationsLoading && visibleConversations.length === 0 && (
             <div className="px-6 py-20 text-center">
-              <Inbox className="mx-auto h-9 w-9 text-[#d0d0d0]" />
-              <p className="mt-3 text-sm text-[#777]">
+              <Inbox className="mx-auto h-9 w-9 text-[var(--text-soft)]" />
+              <p className="mt-3 text-sm text-[var(--text-muted)]">
                 {activeAccount?.connected ? '暂无会话' : '账号离线，无法读取会话'}
               </p>
             </div>
@@ -490,22 +677,22 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
       <section className={`${mobilePane === 'list' ? 'hidden lg:flex' : 'flex'} min-h-0 min-w-0 flex-col`}>
         {activeConversation ? (
           <>
-            <header className="flex h-[68px] shrink-0 items-center justify-between border-b border-[#f0e6c8] px-5">
+            <header className="flex h-[68px] shrink-0 items-center justify-between border-b border-[var(--border)] px-5">
               <div className="flex min-w-0 items-center gap-2">
                 <button
                   type="button"
                   onClick={() => setMobilePane('list')}
-                  className="-ml-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-md hover:bg-[#fff9e8] lg:hidden"
+                  className="-ml-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-md hover:bg-[var(--surface-hover)] lg:hidden"
                   title="返回会话列表"
                   aria-label="返回会话列表"
                 >
                   <ArrowLeft className="h-5 w-5" />
                 </button>
                 <div className="min-w-0">
-                  <h3 className="truncate text-base font-bold text-[#2a2416]">
+                  <h3 className="truncate text-base font-bold text-[var(--text)]">
                     {activeConversation.otherUserName || `闲鱼用户 ${activeConversation.otherUserId}`}
                   </h3>
-                  <p className="mt-0.5 truncate text-xs text-[#999]">
+                  <p className="mt-0.5 truncate text-xs text-[var(--text-soft)]">
                     {activeConversation.otherUserId}
                   </p>
                 </div>
@@ -520,7 +707,7 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
               </span>
             </header>
 
-            <div className="flex min-h-[84px] shrink-0 items-center gap-3 border-b border-[#f0e6c8] px-4 py-3 sm:min-h-[92px] sm:gap-4 sm:px-5">
+            <div className="flex min-h-[84px] shrink-0 items-center gap-3 border-b border-[var(--border)] px-4 py-3 sm:min-h-[92px] sm:gap-4 sm:px-5">
               {normalizeImageUrl(activeConversation.itemImage || activeItem?.item_image) ? (
                 <img
                   src={normalizeImageUrl(activeConversation.itemImage || activeItem?.item_image)}
@@ -528,12 +715,12 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                   className="h-14 w-14 shrink-0 rounded-md object-cover sm:h-16 sm:w-16"
                 />
               ) : (
-                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-md bg-[#fff9e8] text-[#aaa] sm:h-16 sm:w-16">
+                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-md bg-[var(--surface-strong)] text-[var(--text-soft)] sm:h-16 sm:w-16">
                   <Package className="h-5 w-5" />
                 </div>
               )}
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-bold text-[#2a2416]">
+                <p className="truncate text-sm font-bold text-[var(--text)]">
                   {activeConversation.itemTitle || activeItem?.item_title || '未关联商品'}
                 </p>
                 {activeItem?.item_price && (
@@ -542,16 +729,16 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                     {String(activeItem.item_price).replace(/^[¥￥]\s*/, '')}
                   </p>
                 )}
-                <p className="mt-1 truncate text-xs text-[#999]">
+                <p className="mt-1 truncate text-xs text-[var(--text-soft)]">
                   {activeConversation.itemId ? `商品 ID ${activeConversation.itemId}` : '普通会话'}
                 </p>
               </div>
-              <span className="hidden rounded-md bg-[#ffe100] px-4 py-2 text-xs font-bold text-[#2a2416] sm:inline-flex">
+              <span className="hidden rounded-md bg-[var(--brand)] px-4 py-2 text-xs font-bold text-[var(--brand-ink)] sm:inline-flex">
                 {accountName(activeAccount)}
               </span>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto bg-[#fffdf5] px-4 py-6 sm:px-8">
+            <div className="min-h-0 flex-1 overflow-y-auto bg-[var(--app-bg)] px-4 py-6 sm:px-8">
               {messagesLoading && messages.length === 0 ? (
                 <div className="flex h-full items-center justify-center">
                   <Loader2 className="h-6 w-6 animate-spin text-[#d6b600]" />
@@ -564,57 +751,71 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                     const senderLabel = message.isSelf
                       ? accountName(activeAccount)
                       : activeConversation.otherUserName || activeConversation.otherUserId;
+                    // 系统消息（订单状态提醒、语音占位等）没有真实发送方，
+                    // 按聊天气泡渲染会假装成买家发言，居中卡片更贴近原生 App
+                    const isSystem = message.type === 'system';
                     return (
                       <div key={message.messageId || `${message.time}-${index}`}>
                         {showTime && (
-                          <p className="mb-3 text-center text-[11px] text-[#aaa]">
+                          <p className="mb-3 text-center text-[11px] text-[var(--text-soft)]">
                             {formatTimestamp(message.time)}
                           </p>
                         )}
-                        <div className={`flex items-start gap-2.5 ${message.isSelf ? 'justify-end' : ''}`}>
-                          {!message.isSelf && renderAvatar(
-                            activeConversation.otherUserAvatar,
-                            senderLabel,
-                            'h-9 w-9 shrink-0 rounded-full'
-                          )}
-                          <div className={`max-w-[76%] rounded-md px-3.5 py-2.5 text-sm leading-6 ${
-                            message.isSelf ? 'bg-[#ffe100] text-[#2a2416]' : 'bg-white text-[#333]'
-                          }`}>
-                            {message.images.map((url) => (
-                              <img
-                                key={url}
-                                src={normalizeImageUrl(url)}
-                                alt="聊天图片"
-                                className="mb-2 max-h-80 max-w-full rounded object-contain last:mb-0"
-                              />
-                            ))}
-                            {message.text && (
-                              <p className="whitespace-pre-wrap break-words">{message.text}</p>
+                        {isSystem ? (
+                          <div className="flex justify-center">
+                            <div className="inline-flex max-w-[86%] items-start gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2 text-xs leading-5 text-[var(--text-muted)] shadow-sm">
+                              <BellRing className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--text-soft)]" />
+                              <span className="whitespace-pre-wrap break-words">{message.text}</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className={`flex items-start gap-2.5 ${message.isSelf ? 'justify-end' : ''}`}>
+                            {!message.isSelf && renderAvatar(
+                              activeConversation.otherUserAvatar,
+                              senderLabel,
+                              'h-9 w-9 shrink-0 rounded-full',
+                              activeConversation.otherUserId
+                            )}
+                            <div className={`max-w-[76%] rounded-md px-3.5 py-2.5 text-sm leading-6 ${
+                              message.isSelf ? 'bg-[var(--brand)] text-[var(--brand-ink)]' : 'bg-[var(--surface-strong)] text-[var(--text)]'
+                            }`}>
+                              {message.images.map((url) => (
+                                <img
+                                  key={url}
+                                  src={normalizeImageUrl(url)}
+                                  alt="聊天图片"
+                                  className="mb-2 max-h-80 max-w-full rounded object-contain last:mb-0"
+                                />
+                              ))}
+                              {message.text && (
+                                <p className="whitespace-pre-wrap break-words">{renderRichText(message.text)}</p>
+                              )}
+                            </div>
+                            {message.isSelf && renderAvatar(
+                              activeAccount?.avatarUrl,
+                              senderLabel,
+                              'h-9 w-9 shrink-0 rounded-full',
+                              activeAccount?.accountId
                             )}
                           </div>
-                          {message.isSelf && renderAvatar(
-                            activeAccount?.avatarUrl,
-                            senderLabel,
-                            'h-9 w-9 shrink-0 rounded-full'
-                          )}
-                        </div>
+                        )}
                       </div>
                     );
                   })}
                   {messages.length === 0 && !messagesLoading && (
-                    <p className="py-16 text-center text-sm text-[#999]">暂无聊天记录</p>
+                    <p className="py-16 text-center text-sm text-[var(--text-soft)]">暂无聊天记录</p>
                   )}
                   <div ref={messagesEndRef} />
                 </div>
               )}
             </div>
 
-            <footer className="shrink-0 border-t border-[#f0e6c8] bg-white px-4 py-3 sm:px-5">
-              <div className="mb-2 flex items-center gap-4 text-[#555]">
-                <button type="button" title="表情（暂未开放）" className="hover:text-[#111]">
+            <footer className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3 sm:px-5">
+              <div className="mb-2 flex items-center gap-4 text-[var(--text-muted)]">
+                <button type="button" title="表情（暂未开放）" className="hover:text-[var(--text)]">
                   <Smile className="h-5 w-5" />
                 </button>
-                <button type="button" title="图片（暂未开放）" className="hover:text-[#111]">
+                <button type="button" title="图片（暂未开放）" className="hover:text-[var(--text)]">
                   <Image className="h-5 w-5" />
                 </button>
                 <div className="relative">
@@ -622,12 +823,12 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                     type="button"
                     title="快捷短语"
                     onClick={() => setShowPhrases(value => !value)}
-                    className={`hover:text-[#111] ${showPhrases ? 'text-[#111]' : ''}`}
+                    className={`hover:text-[var(--text)] ${showPhrases ? 'text-[var(--text)]' : ''}`}
                   >
                     <Zap className="h-5 w-5" />
                   </button>
                   {showPhrases && (
-                    <div className="absolute bottom-8 left-0 z-20 max-h-72 w-80 overflow-y-auto rounded-lg border border-[#f0e6c8] bg-white p-2 shadow-lg">
+                    <div className="absolute bottom-8 left-0 z-20 max-h-72 w-80 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-2 shadow-lg">
                       {quickPhrases.length === 0 ? (
                         <p className="px-2 py-3 text-xs text-gray-500">
                           还没有快捷短语，可在「设置」中添加。
@@ -638,9 +839,9 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                             key={phrase.id}
                             type="button"
                             onClick={() => insertPhrase(phrase)}
-                            className="block w-full rounded-md px-2 py-2 text-left hover:bg-[#fffdf5]"
+                            className="block w-full rounded-md px-2 py-2 text-left hover:bg-[var(--surface-hover)]"
                           >
-                            <span className="block text-xs font-semibold text-[#2a2416]">
+                            <span className="block text-xs font-semibold text-[var(--text)]">
                               [{phrase.category}] {phrase.title}
                             </span>
                             <span className="mt-0.5 block truncate text-xs text-gray-500">
@@ -666,13 +867,13 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                   rows={2}
                   placeholder={activeAccount?.connected ? '输入消息' : '账号离线，暂时无法发送'}
                   disabled={!activeAccount?.connected}
-                  className="min-h-[56px] min-w-0 flex-1 resize-none border-0 px-0 py-1 text-sm leading-6 outline-none placeholder:text-[#aaa] disabled:bg-white sm:min-h-[72px]"
+                  className="min-h-[56px] min-w-0 flex-1 resize-none border-0 bg-[var(--surface)] px-0 py-1 text-sm leading-6 text-[var(--text)] outline-none placeholder:text-[var(--text-soft)] disabled:bg-[var(--surface)] sm:min-h-[72px]"
                 />
                 <button
                   type="button"
                   onClick={() => void sendMessage()}
                   disabled={!draft.trim() || sending || !activeAccount?.connected}
-                  className="flex h-9 shrink-0 items-center gap-2 rounded-md bg-[#ffe100] px-4 text-sm font-bold text-[#2a2416] hover:bg-[#ffd700] disabled:cursor-not-allowed disabled:bg-[#fff9e8] disabled:text-[#aaa] sm:px-5"
+                  className="flex h-9 shrink-0 items-center gap-2 rounded-md bg-[var(--brand)] px-4 text-sm font-bold text-[var(--brand-ink)] hover:bg-[var(--brand-hover)] disabled:cursor-not-allowed disabled:bg-[var(--surface-strong)] disabled:text-[var(--text-soft)] sm:px-5"
                 >
                   {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                   发送
@@ -682,9 +883,9 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
           </>
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-            <Inbox className="h-12 w-12 text-[#d0d0d0]" />
-            <p className="mt-4 text-sm font-bold text-[#666]">选择一条会话查看消息</p>
-            <p className="mt-1 text-xs text-[#aaa]">会话和聊天记录直接来自当前闲鱼账号</p>
+            <Inbox className="h-12 w-12 text-[var(--text-soft)]" />
+            <p className="mt-4 text-sm font-bold text-[var(--text-muted)]">选择一条会话查看消息</p>
+            <p className="mt-1 text-xs text-[var(--text-soft)]">会话和聊天记录直接来自当前闲鱼账号</p>
           </div>
         )}
       </section>
@@ -692,7 +893,7 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
   );
 
   const renderFilters = () => (
-    <div className="h-full overflow-y-auto bg-[#fffdf5] p-4 sm:p-6 lg:p-8">
+    <div className="h-full overflow-y-auto bg-[var(--app-bg)] p-4 sm:p-6 lg:p-8">
       <div className="page-stack mx-auto max-w-[1320px]">
         <header className="page-header">
           <div>
@@ -807,7 +1008,7 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
 
           <div className="divide-y divide-[#eeeeee] px-4">
             {filters.length > 0 && (
-              <label className="flex items-center gap-3 py-3 text-xs font-bold text-[#777]">
+              <label className="flex items-center gap-3 py-3 text-xs font-bold text-[var(--text-muted)]">
                 <input
                   type="checkbox"
                   checked={selectedAllFilters}
@@ -851,12 +1052,12 @@ const MessageManagement: React.FC<MessageManagementProps> = ({ isActive = true }
                   }`} />
                 </button>
                 <div>
-                  <p className="break-all text-sm font-bold text-[#2a2416]">{filter.cookie_id}</p>
-                  <p className="mt-1 text-xs text-[#888]">{filterTypeLabel[filter.filter_type]}</p>
+                  <p className="break-all text-sm font-bold text-[var(--text)]">{filter.cookie_id}</p>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">{filterTypeLabel[filter.filter_type]}</p>
                 </div>
                 <div className="min-w-0">
-                  <p className="break-words text-sm font-medium text-[#333]">{filter.keyword}</p>
-                  <p className="mt-1 text-xs text-[#aaa]">
+                  <p className="break-words text-sm font-medium text-[var(--text)]">{filter.keyword}</p>
+                  <p className="mt-1 text-xs text-[var(--text-soft)]">
                     {formatDateTime(filter.updated_at || filter.created_at)}
                   </p>
                 </div>

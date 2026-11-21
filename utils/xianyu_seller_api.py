@@ -22,6 +22,7 @@ from loguru import logger
 
 from utils import risk_control
 from utils.xianyu_utils import generate_sign, trans_cookies
+from utils.user_agents import CHROME_UA
 
 
 # 卖家端接口在部分字段上与买家端行为不同，调用方需注意：
@@ -50,11 +51,7 @@ class XianyuSellerAPI:
     BASE_URL = "https://h5api.m.goofish.com/h5/{api}/{version}/"
     ORIGIN = "https://seller.goofish.com"
     SPM_CNT = "a21107h.42826273.0.0"
-    USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/138.0.0.0 Safari/537.36"
-    )
+    USER_AGENT = CHROME_UA
 
     # sold.get 的订单状态筛选，值来自 merchant.order.count 的 countInfoList
     QUERY_CODES = (
@@ -451,6 +448,87 @@ class XianyuSellerAPI:
         )
         return (result.get("data") or {}) or {}
 
+    async def get_order_detail(self, order_id: str) -> Dict[str, Any]:
+        """通过买家端订单详情接口获取订单信息（含 skuInfo 规格字段）。
+
+        ``mtop.idle.web.trade.order.detail`` 返回的 ``skuInfo`` 字段格式固定为
+        ``"规格名:规格值"``（如 ``"尺码:天卡"``），比 ``consign.page.render`` 的
+        ``itemInfoLines`` 更可靠，不受字段排序影响。
+
+        注意：这是买家端接口，origin 必须指向 www.goofish.com。
+        """
+        guard = risk_control.registry.get(self.cookie_id)
+        if guard.is_blocked:
+            raise risk_control.RiskControlBlocked(
+                self.cookie_id, guard.remaining_seconds, guard.last_hit_reason
+            )
+
+        if not self.cookies_str:
+            raise SellerApiError("mtop.idle.web.trade.order.detail", ["Cookie 为空"])
+
+        last_ret: List[str] = []
+        data_val = json.dumps({"tid": str(order_id)}, separators=(",", ":"))
+        timestamp = str(int(time.time() * 1000))
+
+        headers = {
+            "accept": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": "https://www.goofish.com",
+            "referer": "https://www.goofish.com/",
+            "user-agent": self.USER_AGENT,
+            "cookie": self.cookies_str.replace("\n", "").replace("\r", ""),
+        }
+
+        for attempt in range(2):
+            params = {
+                "jsv": "2.7.2",
+                "appKey": self.APP_KEY,
+                "t": timestamp,
+                "sign": generate_sign(timestamp, self._token(), data_val),
+                "v": "1.0",
+                "type": "originaljson",
+                "accountSite": "xianyu",
+                "dataType": "json",
+                "timeout": "20000",
+                "api": "mtop.idle.web.trade.order.detail",
+                "sessionOption": "AutoLoginOnly",
+                "spm_cnt": "a21ybx.order-detail.0.0",
+            }
+
+            session = await self._ensure_session()
+            url = self.BASE_URL.format(api="mtop.idle.web.trade.order.detail", version="1.0")
+            await guard.acquire()
+            async with session.post(
+                url,
+                params=params,
+                data={"data": data_val},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                result = await response.json(content_type=None)
+                self._merge_response_cookies(response)
+
+            ret_list = [str(v) for v in (result.get("ret", []) if isinstance(result, dict) else [])]
+            if any("SUCCESS" in v for v in ret_list):
+                guard.reset()
+                return (result.get("data") or {}) or {}
+
+            last_ret = ret_list
+            if risk_control.is_risk_control_error("; ".join(ret_list)):
+                guard.trip("; ".join(ret_list))
+                raise SellerApiError("mtop.idle.web.trade.order.detail", ret_list)
+
+            token_expired = any(
+                "TOKEN_EXPIRED" in v or "TOKEN_EXOIRED" in v or "FAIL_SYS_TOKEN_EMPTY" in v
+                for v in ret_list
+            )
+            if not token_expired or attempt == 1:
+                break
+            logger.debug(f"【{self.cookie_id}】order.detail 令牌过期，使用新令牌重试")
+
+        raise SellerApiError("mtop.idle.web.trade.order.detail", last_ret)
+
     # ------------------------------------------------------------------
     # 退款
     # ------------------------------------------------------------------
@@ -733,7 +811,6 @@ def parse_consign_render(data: Dict[str, Any]) -> Dict[str, Any]:
     spec_value = ""
     for line in item_vo.get("itemInfoLines") or []:
         key = _text(line.get("key"))
-        # 商品 ID 也放在 itemInfoLines 里，只取规格那一行
         if key and key != "商品ID":
             spec_name = key
             spec_value = _text(line.get("value"))

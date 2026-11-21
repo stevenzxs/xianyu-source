@@ -58,6 +58,9 @@ const AccountList: React.FC = () => {
   const [captchaStage, setCaptchaStage] = useState<'starting' | 'ready' | 'done' | 'failed'>('starting');
   const [captchaMessage, setCaptchaMessage] = useState('');
   const captchaWsRef = useRef<WebSocket | null>(null);
+  // 「在我的浏览器打开验证页」之后的快轮询句柄：用户手动过滑块期间 10s 一拍，
+  // 账号恢复时立刻反映到界面，而不是等默认 30s 轮询
+  const captchaWatchRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const captchaImgRef = useRef<HTMLImageElement>(null);
   const [failedAvatars, setFailedAvatars] = useState<Set<string>>(new Set());
 
@@ -73,15 +76,20 @@ const AccountList: React.FC = () => {
     showLoginPassword: false,
   });
 
-  // AI设置表单状态
+  // AI设置表单状态（字段必须齐全：PUT 是整行 INSERT OR REPLACE，
+  // 少一个字段保存时就会被后端默认值静默覆盖）
   const [aiSettings, setAiSettings] = useState<AIReplySettings>({
     ai_enabled: false,
     model_name: 'qwen-plus',
     api_key: '',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    user_agent: '',
     max_discount_percent: 10,
     max_discount_amount: 100,
     max_bargain_rounds: 3,
+    context_enabled: true,
+    context_message_limit: 12,
+    context_expire_minutes: 120,
     custom_prompts: '',
   });
   const [saving, setSaving] = useState(false);
@@ -141,6 +149,7 @@ const AccountList: React.FC = () => {
       clearInterval(timer);
       qrSessionRef.current = '';
       if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
+      if (captchaWatchRef.current) clearInterval(captchaWatchRef.current);
     };
   }, []);
 
@@ -167,7 +176,31 @@ const AccountList: React.FC = () => {
       }
       if (result.verification_url) {
         window.open(result.verification_url, '_blank', 'noopener,noreferrer');
-        notify('已打开验证页，请用鼠标拖动滑块完成验证', 'info');
+        notify('已打开验证页；滑块通过后页面可能跳转到淘宝，属正常现象，直接关闭即可', 'info');
+        // 后端取链接时已解除熔断，心跳正在恢复令牌。这里临时加密轮询（10s × 3 分钟），
+        // 验证生效后账号状态立刻刷新 —— 用户不用猜「验证到底成没成」
+        if (captchaWatchRef.current) clearInterval(captchaWatchRef.current);
+        let ticks = 18;
+        captchaWatchRef.current = setInterval(async () => {
+          ticks -= 1;
+          try {
+            const status = await getRiskControlStatus();
+            const stillBlocked = (status.accounts || []).some(
+              item => item.blocked || (item.verification_type && item.verification_type !== 'none')
+            );
+            if (!stillBlocked) {
+              if (captchaWatchRef.current) clearInterval(captchaWatchRef.current);
+              captchaWatchRef.current = null;
+              notify('验证已生效，账号恢复运行', 'success');
+              loadAccounts({ silent: true });
+            } else if (ticks <= 0 && captchaWatchRef.current) {
+              clearInterval(captchaWatchRef.current);
+              captchaWatchRef.current = null;
+            }
+          } catch {
+            // 单次轮询失败忽略，等下一拍或默认 30s 轮询兜底
+          }
+        }, 10000);
       }
     } catch (error) {
       notify(error instanceof Error ? error.message : '获取验证链接失败', 'error');
@@ -334,14 +367,20 @@ const AccountList: React.FC = () => {
     setSaving(true);
     try {
       const settings = await getAccountAISettings(account.id);
+      // 全量加载：PUT 是整行覆盖保存，漏掉的字段（user_agent、
+      // context_* 等）会被后端默认值静默重置
       setAiSettings({
         ai_enabled: settings.ai_enabled ?? false,
         model_name: settings.model_name || 'qwen-plus',
         api_key: settings.api_key || '',
         base_url: settings.base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        user_agent: settings.user_agent ?? '',
         max_discount_percent: settings.max_discount_percent ?? 10,
         max_discount_amount: settings.max_discount_amount ?? 100,
         max_bargain_rounds: settings.max_bargain_rounds ?? 3,
+        context_enabled: settings.context_enabled ?? true,
+        context_message_limit: settings.context_message_limit ?? 12,
+        context_expire_minutes: settings.context_expire_minutes ?? 120,
         custom_prompts: settings.custom_prompts ?? '',
       });
     } catch (e) {
@@ -644,7 +683,7 @@ const AccountList: React.FC = () => {
                     <span className="flex items-center gap-1.5">
                       <Users className="h-4 w-4 text-gray-400" />
                       {account.followers?.toLocaleString() ?? '--'} 粉丝
-                      <span className="text-gray-300">/</span>
+                      <span className="text-gray-400">/</span>
                       {account.following?.toLocaleString() ?? '--'} 关注
                     </span>
                   )}
@@ -786,7 +825,7 @@ const AccountList: React.FC = () => {
 
                   <div className="modal-body py-5">
                       <div className="text-center">
-                          <div className="relative mx-auto flex h-60 w-60 items-center justify-center overflow-hidden rounded-md border border-gray-200 bg-gray-50">
+                          <div className="media-light-surface relative mx-auto flex h-60 w-60 items-center justify-center overflow-hidden rounded-md border border-gray-200 bg-gray-50">
                               {qrStatus === 'loading' && <Loader2 className="h-9 w-9 animate-spin text-amber-500" />}
                               {(qrStatus === 'waiting' || qrStatus === 'scanned') && (
                                   <img src={qrCodeUrl} alt="闲鱼登录二维码" className="h-full w-full p-2" />

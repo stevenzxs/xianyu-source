@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -20,10 +20,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from app import cookie_manager
 from app.db_manager import db_manager
+from app.delivery_template import send_payload as send_delivery_payload
 from app.product_automation import ProductAutomationService
 from app.file_log_collector import setup_file_logging, get_file_log_collector
 from app.ai_reply_engine import ai_reply_engine
+from app.services.notification_channels import (
+    NOTIFICATION_CHANNEL_REQUIRED_FIELDS,
+    NOTIFICATION_CHANNEL_TYPE_ALIASES,
+    validate_notification_channel,
+)
+from app.services.notification_sender import NotificationSender
+from app.services.notification_test import (
+    NotificationTestError,
+    NotificationTestService,
+    notification_test_rate_limiter,
+)
 from app.routers.delivery_block import create_delivery_block_router
+from app.routers.logistics_quote import create_logistics_quote_router
+from app.routers.logistics_agent import create_logistics_agent_router
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
@@ -36,6 +50,12 @@ from utils.order_status_rules import (
 from loguru import logger
 
 product_automation = ProductAutomationService(db_manager)
+notification_sender = NotificationSender()
+notification_test_service = NotificationTestService(
+    db_manager,
+    sender=notification_sender,
+    limiter=notification_test_rate_limiter,
+)
 
 # 刮刮乐远程控制路由
 try:
@@ -53,6 +73,14 @@ ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+
+# 认证防刷（进程内状态，重启清零，与 SESSION_TOKENS 同一取舍）
+from app.services.auth_protection import email_code_send_limiter, login_failure_tracker
+from app.auth_validators import (
+    validate_email,
+    validate_password,
+    validate_username,
+)
 
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
@@ -128,6 +156,9 @@ class LoginRequest(BaseModel):
     password: Optional[str] = None
     email: Optional[str] = None
     verification_code: Optional[str] = None
+    # 连续登录失败达到阈值后，后端强制要求图形验证码（防爆破）
+    captcha_session_id: Optional[str] = None
+    captcha_code: Optional[str] = None
 
 
 class LoginResponse(BaseModel):
@@ -137,11 +168,18 @@ class LoginResponse(BaseModel):
     user_id: Optional[int] = None
     username: Optional[str] = None
     is_admin: Optional[bool] = None
+    # True 表示下一次登录必须携带图形验证码
+    captcha_required: Optional[bool] = False
 
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class UpdateProfileRequest(BaseModel):
+    new_username: str
+    current_password: str
 
 
 class RegisterRequest(BaseModel):
@@ -161,6 +199,9 @@ class SendCodeRequest(BaseModel):
     email: str
     session_id: Optional[str] = None
     type: Optional[str] = 'register'  # 'register' 或 'login'
+    # 发邮箱码前必须先通过图形验证码（防刷发件资源）
+    captcha_session_id: Optional[str] = None
+    captcha_code: Optional[str] = None
 
 
 class SendCodeResponse(BaseModel):
@@ -337,6 +378,12 @@ else:
 app.include_router(create_delivery_block_router(get_current_user, db_manager))
 logger.info("已注册发货拦截规则路由")
 
+app.include_router(create_logistics_quote_router(get_current_user, db_manager))
+logger.info("已注册物流报价解析路由")
+
+app.include_router(create_logistics_agent_router(get_current_user, db_manager))
+logger.info("已注册物流 Agent 路由")
+
 # 初始化文件日志收集器
 setup_file_logging()
 
@@ -360,6 +407,7 @@ async def log_requests(request, call_next):
 
 # 提供前端静态文件
 import os
+from utils.user_agents import CHROME_UA
 static_dir = str(PROJECT_ROOT / 'static')
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
@@ -435,7 +483,9 @@ async def serve_frontend():
     index_path = os.path.join(static_dir, 'index.html')
     if os.path.exists(index_path):
         with open(index_path, 'r', encoding='utf-8') as f:
-            return HTMLResponse(f.read())
+            # index.html 引用带哈希的静态资源，本身禁用缓存，
+            # 避免发新版后浏览器仍加载旧页面（哈希资源本身可正常缓存）。
+            return HTMLResponse(f.read(), headers={'Cache-Control': 'no-cache'})
     else:
         return HTMLResponse('<h3>Frontend not found. Please build the frontend first.</h3>')
 
@@ -499,6 +549,23 @@ async def register_route():
 
 
 # 登录接口
+def _login_captcha_required(fail_key: str) -> bool:
+    """登录防爆破：开关开启（默认）且连续失败达阈值时，要求先过图形验证码。"""
+    from app.db_manager import db_manager
+    enabled = db_manager.get_system_setting('login_captcha_enabled')
+    if str(enabled or 'true').strip().lower() in ('0', 'false', 'no'):
+        return False
+    return login_failure_tracker.requires_captcha(fail_key)
+
+
+def _verify_login_captcha(request: LoginRequest) -> bool:
+    """校验登录请求携带的图形验证码；错误同样累计图形码失败次数。"""
+    from app.db_manager import db_manager
+    if not request.captcha_session_id or not request.captcha_code:
+        return False
+    return db_manager.verify_captcha(request.captcha_session_id, request.captcha_code)
+
+
 @app.post('/login')
 async def login(request: LoginRequest):
     from app.db_manager import db_manager
@@ -508,10 +575,21 @@ async def login(request: LoginRequest):
         # 用户名/密码登录
         logger.info(f"【{request.username}】尝试用户名登录")
 
+        # 防爆破：连续失败达阈值后必须先过图形验证码
+        fail_key = (request.username or '').strip().lower()
+        if _login_captcha_required(fail_key) and not _verify_login_captcha(request):
+            logger.warning(f"【{request.username}】登录被拦：需先完成图形验证")
+            return LoginResponse(
+                success=False,
+                message="登录失败次数过多，请先完成图形验证",
+                captcha_required=True
+            )
+
         # 统一使用用户表验证（包括admin用户）
         if db_manager.verify_user_password(request.username, request.password):
             user = db_manager.get_user_by_username(request.username)
             if user:
+                login_failure_tracker.reset(fail_key)
                 # 生成token
                 token = generate_token()
                 SESSION_TOKENS[token] = {
@@ -536,18 +614,31 @@ async def login(request: LoginRequest):
                     is_admin=(user['username'] == ADMIN_USERNAME)
                 )
 
+        login_failure_tracker.record_failure(fail_key)
         logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
         return LoginResponse(
             success=False,
-            message="用户名或密码错误"
+            message="用户名或密码错误",
+            captcha_required=_login_captcha_required(fail_key)
         )
 
     elif request.email and request.password:
         # 邮箱/密码登录
         logger.info(f"【{request.email}】尝试邮箱密码登录")
 
+        # 防爆破：连续失败达阈值后必须先过图形验证码
+        fail_key = (request.email or '').strip().lower()
+        if _login_captcha_required(fail_key) and not _verify_login_captcha(request):
+            logger.warning(f"【{request.email}】登录被拦：需先完成图形验证")
+            return LoginResponse(
+                success=False,
+                message="登录失败次数过多，请先完成图形验证",
+                captcha_required=True
+            )
+
         user = db_manager.get_user_by_email(request.email)
         if user and db_manager.verify_user_password(user['username'], request.password):
+            login_failure_tracker.reset(fail_key)
             # 生成token
             token = generate_token()
             SESSION_TOKENS[token] = {
@@ -568,10 +659,12 @@ async def login(request: LoginRequest):
                 is_admin=(user['username'] == ADMIN_USERNAME)
             )
 
+        login_failure_tracker.record_failure(fail_key)
         logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
         return LoginResponse(
             success=False,
-            message="邮箱或密码错误"
+            message="邮箱或密码错误",
+            captcha_required=_login_captcha_required(fail_key)
         )
 
     elif request.email and request.verification_code:
@@ -649,6 +742,11 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
     from app.db_manager import db_manager
 
     try:
+        # 新密码强度校验（旧密码不校验格式，只验证正确性）
+        valid, reason = validate_password(request.new_password)
+        if not valid:
+            return {"success": False, "message": reason}
+
         # 验证当前密码（使用用户表验证）
         if not db_manager.verify_user_password('admin', request.current_password):
             return {"success": False, "message": "当前密码错误"}
@@ -679,6 +777,11 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
         if not username:
             return {"success": False, "message": "无法获取用户信息"}
 
+        # 新密码强度校验（旧密码不校验格式，只验证正确性）
+        valid, reason = validate_password(request.new_password)
+        if not valid:
+            return {"success": False, "message": reason}
+
         # 验证当前密码
         if not db_manager.verify_user_password(username, request.current_password):
             return {"success": False, "message": "当前密码错误"}
@@ -695,6 +798,43 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
     except Exception as e:
         logger.error(f"修改用户密码异常: {e}")
         return {"success": False, "message": "系统错误"}
+
+
+@app.put('/profile')
+async def update_profile(request: UpdateProfileRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from app.db_manager import db_manager
+
+    username = current_user.get('username')
+    user_id = current_user.get('user_id')
+    new_username = request.new_username.strip()
+
+    if not username or user_id is None:
+        return {"success": False, "message": "无法获取用户信息"}
+    if username == ADMIN_USERNAME:
+        return {"success": False, "message": "管理员用户名是系统身份，不能修改"}
+
+    valid, reason = validate_username(new_username)
+    if not valid:
+        return {"success": False, "message": reason}
+    if new_username == username:
+        return {"success": False, "message": "新用户名与当前相同"}
+
+    # 先验密码再查重：密码错误不该泄露目标用户名是否可用
+    if not db_manager.verify_user_password(username, request.current_password):
+        return {"success": False, "message": "当前密码错误"}
+    if db_manager.get_user_by_username(new_username):
+        return {"success": False, "message": "该用户名已被占用"}
+
+    if not db_manager.update_username(username, new_username):
+        return {"success": False, "message": "用户名修改失败"}
+
+    # 同步内存 token 里的用户名，旧 token 继续有效（避免改完名立即被踢重新登录）
+    for token_data in SESSION_TOKENS.values():
+        if token_data.get('user_id') == user_id:
+            token_data['username'] = new_username
+
+    logger.info(f"【{username}#{user_id}】用户名修改为 {new_username}")
+    return {"success": True, "message": "用户名修改成功", "username": new_username}
 
 
 # 检查是否使用默认密码
@@ -967,26 +1107,42 @@ async def geetest_validate(request: GeetestValidateRequest):
         )
 
 
-# 发送验证码接口（需要先验证图形验证码）
+# 发送验证码接口（需先通过图形验证码，且带发送频率限制）
 @app.post('/send-verification-code')
 async def send_verification_code(request: SendCodeRequest):
     from app.db_manager import db_manager
 
     try:
-        # 检查是否已验证图形验证码
-        # 通过检查数据库中是否存在已验证的图形验证码记录
-        with db_manager.lock:
-            cursor = db_manager.conn.cursor()
-            current_time = time.time()
+        # 1. 邮箱格式校验
+        valid, reason = validate_email(request.email)
+        if not valid:
+            return SendCodeResponse(success=False, message=reason)
 
-            # 查找最近5分钟内该session_id的验证记录
-            # 由于验证成功后验证码会被删除，我们需要另一种方式来跟踪验证状态
-            # 这里我们检查该session_id是否在最近验证过（通过检查是否有已删除的记录）
+        # 2. 强制图形验证码：一次请求内"先验后发"，
+        #    避免两段式留下"验完不发"的绕过窗口。
+        #    图形码错在冷却配额之前被拦下，不消耗邮箱发送次数
+        if not request.captcha_session_id or not request.captcha_code:
+            return SendCodeResponse(
+                success=False,
+                message="请先输入图形验证码"
+            )
+        if not db_manager.verify_captcha(request.captcha_session_id, request.captcha_code):
+            return SendCodeResponse(
+                success=False,
+                message="图形验证码错误或已过期"
+            )
 
-            # 为了简化，我们要求前端在验证图形验证码成功后立即发送邮件验证码
-            # 或者我们可以在验证成功后设置一个临时标记
+        # 3. 发送频率限制：同邮箱 60s 冷却 + 每日上限
+        wait_seconds = email_code_send_limiter.acquire(request.email)
+        if wait_seconds is not None:
+            return SendCodeResponse(
+                success=False,
+                message=f"发送过于频繁，请 {wait_seconds // 60} 分钟后再试"
+                if wait_seconds >= 60 else
+                f"发送过于频繁，请 {wait_seconds} 秒后再试"
+            )
 
-        # 根据验证码类型进行不同的检查
+        # 4. 根据验证码类型进行不同的检查
         if request.type == 'register':
             # 注册验证码：检查邮箱是否已注册
             existing_user = db_manager.get_user_by_email(request.email)
@@ -1004,17 +1160,17 @@ async def send_verification_code(request: SendCodeRequest):
                     message="该邮箱未注册"
                 )
 
-        # 生成验证码
+        # 5. 生成验证码
         code = db_manager.generate_verification_code()
 
-        # 保存验证码到数据库
+        # 6. 保存验证码到数据库（重发时自动作废旧活码）
         if not db_manager.save_verification_code(request.email, code, request.type):
             return SendCodeResponse(
                 success=False,
                 message="验证码保存失败，请稍后重试"
             )
 
-        # 发送验证码邮件
+        # 7. 发送验证码邮件
         if await db_manager.send_verification_email(request.email, code):
             return SendCodeResponse(
                 success=True,
@@ -1050,6 +1206,17 @@ async def register(request: RegisterRequest):
 
     try:
         logger.info(f"【{request.username}】尝试注册，邮箱: {request.email}")
+
+        # 格式与强度校验放在验码之前：格式错误不消耗验证码的错误次数配额
+        for field, validator in (
+            (request.username, validate_username),
+            (request.email, validate_email),
+            (request.password, validate_password),
+        ):
+            valid, reason = validator(field)
+            if not valid:
+                logger.warning(f"【{request.username}】注册失败: {reason}")
+                return RegisterResponse(success=False, message=reason)
 
         # 邮箱验证码是否必填由管理员在系统设置里控制。
         # 没配 SMTP 的部署发不出验证码，强制校验会让注册完全不可用；
@@ -1611,6 +1778,14 @@ class NotificationChannelUpdate(BaseModel):
 class MessageNotificationIn(BaseModel):
     channel_id: int
     enabled: bool = True
+    name: Optional[str] = None
+    event_types: Optional[List[str]] = None
+
+
+class MessageNotificationUpdate(BaseModel):
+    name: Optional[str] = None
+    event_types: Optional[List[str]] = None
+    enabled: Optional[bool] = None
 
 
 class MessageFilterIn(BaseModel):
@@ -1655,89 +1830,36 @@ def validate_message_filter(cookie_id: str, keyword: str, filter_type: str) -> T
     return normalized_cookie_id, normalized_keyword, normalized_type
 
 
-NOTIFICATION_CHANNEL_REQUIRED_FIELDS = {
-    "dingtalk": ("webhook_url",),
-    "feishu": ("webhook_url",),
-    "bark": ("device_key",),
-    "email": ("smtp_server", "smtp_port", "email_user", "email_password", "recipient_email"),
-    "webhook": ("webhook_url",),
-    "wechat": ("webhook_url",),
-    "telegram": ("bot_token", "chat_id"),
-}
-NOTIFICATION_CHANNEL_TYPE_ALIASES = {
-    "ding_talk": "dingtalk",
-    "lark": "feishu",
-}
+def validate_notification_rule(
+    name: Optional[str],
+    event_types: Optional[List[str]],
+) -> Tuple[Optional[str], Optional[List[str]]]:
+    """Validate and normalize account notification rule data."""
+    from app.notification_events import normalize_event_types
 
-
-def validate_notification_channel(
-    name: str,
-    channel_type: str,
-    config: str,
-) -> Tuple[str, str, str]:
-    """Validate and normalize notification channel data before persistence."""
     normalized_name = (name or "").strip()
-    if not normalized_name:
-        raise ValueError("通知渠道名称不能为空")
     if len(normalized_name) > 80:
-        raise ValueError("通知渠道名称不能超过 80 个字符")
-
-    normalized_type = (channel_type or "").strip().lower()
-    normalized_type = NOTIFICATION_CHANNEL_TYPE_ALIASES.get(normalized_type, normalized_type)
-    if normalized_type not in NOTIFICATION_CHANNEL_REQUIRED_FIELDS:
-        raise ValueError("不支持的通知渠道类型")
-
+        raise ValueError("通知规则名称不能超过 80 个字符")
     try:
-        config_data = json.loads(config)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("通知渠道配置必须是有效的 JSON") from exc
-    if not isinstance(config_data, dict):
-        raise ValueError("通知渠道配置必须是 JSON 对象")
-
-    missing_fields = [
-        field
-        for field in NOTIFICATION_CHANNEL_REQUIRED_FIELDS[normalized_type]
-        if config_data.get(field) in (None, "")
-    ]
-    if missing_fields:
-        raise ValueError(f"通知渠道配置缺少字段: {', '.join(missing_fields)}")
-
-    if normalized_type == "email":
-        try:
-            smtp_port = int(config_data["smtp_port"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("SMTP 端口必须是数字") from exc
-        if not 1 <= smtp_port <= 65535:
-            raise ValueError("SMTP 端口必须在 1-65535 之间")
-        config_data["smtp_port"] = smtp_port
-
-    if normalized_type == "webhook":
-        http_method = str(config_data.get("http_method", "POST")).upper()
-        if http_method not in {"POST", "PUT"}:
-            raise ValueError("Webhook 请求方法仅支持 POST 或 PUT")
-        config_data["http_method"] = http_method
-
-        headers = config_data.get("headers")
-        if isinstance(headers, str) and headers.strip():
-            try:
-                parsed_headers = json.loads(headers)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Webhook 请求头必须是有效的 JSON 对象") from exc
-            if not isinstance(parsed_headers, dict):
-                raise ValueError("Webhook 请求头必须是 JSON 对象")
-        elif headers is not None and not isinstance(headers, dict):
-            raise ValueError("Webhook 请求头必须是 JSON 对象")
-
-    return (
-        normalized_name,
-        normalized_type,
-        json.dumps(config_data, ensure_ascii=False, separators=(",", ":")),
-    )
+        normalized_events = normalize_event_types(event_types)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    return normalized_name or None, normalized_events
 
 
 class SystemSettingIn(BaseModel):
     value: str
     description: Optional[str] = None
+
+
+class EmailTestIn(BaseModel):
+    """测试发信：SMTP 连接参数来自设置页表单当前值，测试前无需保存"""
+    to: str
+    smtp_server: str = ''
+    smtp_port: int = 0
+    smtp_user: str = ''
+    smtp_password: str = ''
+    smtp_from: str = ''
 
 
 class SystemSettingCreateIn(BaseModel):
@@ -3448,6 +3570,16 @@ def delete_notification_channel(channel_id: int, current_user: Dict[str, Any] = 
 
 # ------------------------- 消息通知配置接口 -------------------------
 
+@app.get('/notification-events')
+def get_notification_events(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取可订阅的通知事件类型和优先级"""
+    from app.notification_events import get_event_definitions, get_priority_definitions
+    return {
+        'priorities': get_priority_definitions(),
+        'events': get_event_definitions(),
+    }
+
+
 @app.get('/message-notifications')
 def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户所有账号的消息通知配置"""
@@ -3458,6 +3590,44 @@ def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_cur
         return db_manager.get_all_message_notifications(user_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/message-notifications/rule/{rule_id}/test')
+async def test_message_notification_rule(
+    rule_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """向一条账号通知规则绑定的渠道发送一条真实测试消息。"""
+    user_info = {
+        "user_id": current_user.get("user_id"),
+        "username": current_user.get("username", ""),
+    }
+    try:
+        return await notification_test_service.send_rule_test(
+            rule_id,
+            int(current_user["user_id"]),
+            user_info,
+        )
+    except NotificationTestError as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail(),
+            headers=headers,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - keep unexpected errors non-sensitive
+        log_with_user(
+            "error",
+            f"source=notification_test rule_id={rule_id} result=server_error",
+            user_info,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "notification_send_failed",
+                "message": "通知测试服务暂时不可用，请稍后重试",
+            },
+        ) from exc
 
 
 @app.get('/message-notifications/{cid}')
@@ -3481,7 +3651,7 @@ def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(g
 
 @app.post('/message-notifications/{cid}')
 def set_message_notification(cid: str, notification_data: MessageNotificationIn, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """设置账号的消息通知"""
+    """创建或设置账号的消息通知规则"""
     from app.db_manager import db_manager
     try:
         # 检查cookie是否属于当前用户
@@ -3496,11 +3666,66 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
 
+        try:
+            rule_name, rule_events = validate_notification_rule(
+                notification_data.name,
+                notification_data.event_types,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # 带规则名或事件类型的请求视为新建规则；旧客户端只开关绑定，保持原语义
+        if notification_data.name is not None or notification_data.event_types is not None:
+            rule_id = db_manager.create_notification_rule(
+                cid,
+                notification_data.channel_id,
+                rule_name,
+                rule_events,
+                notification_data.enabled,
+            )
+            return {'msg': 'message notification rule created', 'id': rule_id}
+
         success = db_manager.set_message_notification(cid, notification_data.channel_id, notification_data.enabled)
         if success:
             return {'msg': 'message notification set'}
         else:
             raise HTTPException(status_code=400, detail='设置失败')
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put('/message-notifications/rule/{rule_id}')
+def update_message_notification_rule(rule_id: int, rule_data: MessageNotificationUpdate,
+                                     current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新账号通知规则"""
+    from app.db_manager import db_manager
+    try:
+        user_id = current_user['user_id']
+        existing_rule = db_manager.get_notification_rule(rule_id, user_id)
+        if not existing_rule:
+            raise HTTPException(status_code=404, detail='通知规则不存在')
+
+        try:
+            rule_name, rule_events = validate_notification_rule(
+                rule_data.name if rule_data.name is not None else existing_rule['name'],
+                rule_data.event_types if rule_data.event_types is not None else existing_rule['event_types'],
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        success = db_manager.update_notification_rule(
+            rule_id,
+            rule_name,
+            rule_events,
+            rule_data.enabled if rule_data.enabled is not None else existing_rule['enabled'],
+            user_id,
+        )
+        if success:
+            return {'msg': 'message notification rule updated'}
+        else:
+            raise HTTPException(status_code=404, detail='通知规则不存在')
     except HTTPException:
         raise
     except Exception as e:
@@ -3775,14 +4000,26 @@ def get_public_system_settings():
 
 
 @app.get('/system-settings')
-def get_system_settings(_: Dict[str, Any] = Depends(require_admin)):
-    """获取系统设置（排除敏感信息）"""
+def get_system_settings(current_user: Dict[str, Any] = Depends(require_auth)):
+    """获取系统设置。管理员拿全量（排除敏感信息），普通用户只拿业务白名单。
+
+    普通用户的常驻页面（如买家互动）会读业务模板配置，但 SMTP、注册开关等
+    系统级设置不属于他们，也不应让其感知键名。
+    """
     from app.db_manager import db_manager
+    # 普通用户可见的业务设置白名单（买家互动模板等）
+    USER_VISIBLE_KEYS = {
+        'auto_rate_template', 'auto_thanks_template',
+        'auto_rate_enabled', 'auto_flower_enabled', 'auto_receive_flower_enabled',
+        'buyer_interaction_interval',
+    }
     try:
         settings = db_manager.get_all_system_settings()
         # 移除敏感信息
         if 'admin_password_hash' in settings:
             del settings['admin_password_hash']
+        if current_user['username'] != ADMIN_USERNAME:
+            settings = {k: v for k, v in settings.items() if k in USER_VISIBLE_KEYS}
         return settings
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3807,6 +4044,31 @@ def update_system_setting(key: str, setting_data: SystemSettingIn,
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/system-settings/email-test')
+async def send_email_test(data: EmailTestIn, _: Dict[str, Any] = Depends(require_admin)):
+    """用设置页表单当前的 SMTP 配置发一封测试邮件，验证邮件服务可用性。"""
+    import re
+    from app.db_manager import db_manager
+    to = data.to.strip()
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', to):
+        return {'success': False, 'message': '请输入正确的收件邮箱地址'}
+    if not (data.smtp_server.strip() and data.smtp_port and data.smtp_user.strip() and data.smtp_password.strip()):
+        return {'success': False, 'message': '请先完整填写 SMTP 服务器、端口、发件邮箱和授权码'}
+    # TLS/SSL 开关不在表单里，沿用库中已保存的值（默认 TLS 开、SSL 关）
+    smtp_use_tls = (db_manager.get_system_setting('smtp_use_tls') or 'true').lower() == 'true'
+    smtp_use_ssl = (db_manager.get_system_setting('smtp_use_ssl') or 'false').lower() == 'true'
+    smtp_from = data.smtp_from.strip() or data.smtp_user.strip()
+    try:
+        ok, message = await db_manager.send_test_email(
+            to, data.smtp_server.strip(), int(data.smtp_port),
+            data.smtp_user.strip(), data.smtp_password.strip(),
+            smtp_from, smtp_use_tls, smtp_use_ssl)
+        return {'success': ok, 'message': message}
+    except Exception as e:
+        logger.error(f"测试发信异常: {e}")
+        return {'success': False, 'message': f'测试发信异常：{e}'}
 
 
 # ------------------------- 注册设置接口 -------------------------
@@ -4779,6 +5041,9 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             description=card_data.get('description'),
             enabled=card_data.get('enabled', True),
             delay_seconds=card_data.get('delay_seconds', 0),
+            delivery_template=card_data.get('delivery_template'),
+            delivery_template_enabled=card_data.get('delivery_template_enabled', False),
+            delivery_template_images=card_data.get('delivery_template_images'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name') if is_multi_spec else None,
             spec_value=card_data.get('spec_value') if is_multi_spec else None,
@@ -4791,6 +5056,30 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
         raise
     except Exception as e:
         log_with_user('error', f"创建卡券失败: {card_data.get('name', '未知')} - {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cards/shipped")
+def get_card_shipments(limit: int = 200, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取当前用户已发货的批量卡密记录"""
+    try:
+        from app.db_manager import db_manager
+        user_id = current_user['user_id']
+        result = db_manager.get_card_shipments(user_id, limit=limit)
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/cards/shipped")
+def clear_card_shipments(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """清空当前用户的已发货卡密记录"""
+    try:
+        from app.db_manager import db_manager
+        user_id = current_user['user_id']
+        deleted = db_manager.clear_card_shipments(user_id)
+        return {"success": True, "deleted": deleted, "message": f"已清空 {deleted} 条发货记录"}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -4833,6 +5122,9 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
             description=card_data.get('description'),
             enabled=card_data.get('enabled', True),
             delay_seconds=card_data.get('delay_seconds'),
+            delivery_template=card_data.get('delivery_template'),
+            delivery_template_enabled=card_data.get('delivery_template_enabled'),
+            delivery_template_images=card_data.get('delivery_template_images'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
             spec_value=card_data.get('spec_value'),
@@ -5527,6 +5819,151 @@ class ItemDeliveryConfigIn(BaseModel):
     is_multi_spec: bool = False
     variants: List[ProductVariantBindingIn]
 
+class DeliverySkuRuleIn(BaseModel):
+    key: str
+    name: str
+    max_deliveries: int = Field(default=1, ge=1, le=100)
+    block_message: str = ""
+    enabled: bool = True
+
+class DeliverySkuRulesIn(BaseModel):
+    skus: List[DeliverySkuRuleIn] = []
+
+def _replace_delivery_sku_discovery(cookie_id: str, item_id: str, rows: List[Dict[str, Any]]) -> None:
+    """把一次平台识别的结果作为该商品的 discovery 快照全量替换落库。"""
+    with db_manager.lock:
+        db_manager.conn.execute(
+            "DELETE FROM delivery_sku_options WHERE cookie_id=? AND item_id=? AND source='discovery'",
+            (cookie_id, item_id),
+        )
+        db_manager.conn.commit()
+    for row in rows:
+        db_manager.record_delivery_sku_option(
+            cookie_id, item_id, row.get("name", ""), row.get("platform_sku_id", ""),
+            source="discovery", sku_key=row.get("key", ""),
+        )
+
+
+def _delivery_sku_identity_row(item_id: str) -> List[Dict[str, Any]]:
+    """接口正常但商品没有可读规格时，补一条默认规格占位。"""
+    return [{"key": f"single:{item_id}", "name": "默认规格", "platform_sku_id": "", "synthetic": True}]
+
+@app.get("/api/anti-abuse/sku-options/{item_id}")
+async def get_delivery_sku_options(item_id: str, cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if cookie_id not in db_manager.get_all_cookies(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="无权访问该闲鱼账号")
+    # 每次点击“识别 SKU”都直接查询商家接口，不依赖订单是否完成。
+    cookie_info = db_manager.get_cookie_by_id(cookie_id)
+    cookies_str = (cookie_info or {}).get("cookies_str", "")
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="该账号 Cookie 为空，请先登录后再识别 SKU")
+
+    from utils import risk_control
+    from utils.xianyu_seller_api import XianyuSellerAPI, SellerApiError, classify_sku_discovery_error
+
+    detection_status = "ok"
+    warning = ""
+    retry_after_seconds = 0
+    discovery_error = ""
+    api = XianyuSellerAPI(cookie_id, cookies_str)
+    try:
+        discovered = await api.search_item_skus(item_id)
+        if not discovered:
+            discovered = _delivery_sku_identity_row(item_id)
+        _replace_delivery_sku_discovery(cookie_id, item_id, discovered)
+    except risk_control.RiskControlBlocked as exc:
+        detection_status = "risk_control"
+        retry_after_seconds = int(getattr(exc, "remaining", 0) or 0)
+        warning = str(exc)
+    except SellerApiError as exc:
+        detection_status = classify_sku_discovery_error(exc)
+        discovery_error = str(exc)
+        warning = discovery_error
+        if detection_status == "risk_control":
+            retry_after_seconds = risk_control.registry.get(cookie_id).remaining_seconds
+    except Exception as exc:
+        detection_status = "error"
+        discovery_error = str(exc)
+        warning = discovery_error
+        logger.warning(f"【{cookie_id}】商品 {item_id} SKU 识别异常: {discovery_error}")
+    finally:
+        await api.close()
+
+    options = db_manager.list_delivery_sku_options(cookie_id, item_id)
+    if detection_status == "error" and not options:
+        raise HTTPException(status_code=502, detail=f"闲鱼商家 SKU 接口调用失败：{discovery_error}")
+    result: Dict[str, Any] = {"item_id": item_id, "options": options, "detection_status": detection_status}
+    if warning:
+        result["warning"] = warning
+    if retry_after_seconds:
+        result["retry_after_seconds"] = retry_after_seconds
+    return result
+
+@app.get("/api/anti-abuse/sku-options/{item_id}/buyer-test")
+async def buyer_test_delivery_sku_options(item_id: str, cookie_id: str,
+                                          current_user: Dict[str, Any] = Depends(get_current_user)):
+    """买家接口兜底识别：卖家接口无权限时由用户显式触发，只调一次、不自动重试。"""
+    if cookie_id not in db_manager.get_all_cookies(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="无权访问该闲鱼账号")
+    cookie_info = db_manager.get_cookie_by_id(cookie_id)
+    cookies_str = (cookie_info or {}).get("cookies_str", "")
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="该账号 Cookie 为空，请先登录后再识别 SKU")
+
+    from utils import risk_control
+    from utils.xianyu_seller_api import XianyuSellerAPI, SellerApiError, classify_sku_discovery_error
+
+    retry_after_seconds = 0
+    warning = ""
+    api = XianyuSellerAPI(cookie_id, cookies_str)
+    try:
+        discovered = await api.search_item_skus_buyer(item_id)
+        if not discovered:
+            discovered = _delivery_sku_identity_row(item_id)
+        _replace_delivery_sku_discovery(cookie_id, item_id, discovered)
+    except risk_control.RiskControlBlocked as exc:
+        retry_after_seconds = int(getattr(exc, "remaining", 0) or 0)
+        warning = str(exc)
+        return {
+            "item_id": item_id, "options": db_manager.list_delivery_sku_options(cookie_id, item_id),
+            "detection_status": "risk_control", "retry_after_seconds": retry_after_seconds,
+            "warning": warning, "test_only": True,
+        }
+    except SellerApiError as exc:
+        status = classify_sku_discovery_error(exc)
+        if status in ("risk_control", "unauthorized"):
+            if status == "risk_control":
+                retry_after_seconds = risk_control.registry.get(cookie_id).remaining_seconds
+            return {
+                "item_id": item_id, "options": db_manager.list_delivery_sku_options(cookie_id, item_id),
+                "detection_status": status, "retry_after_seconds": retry_after_seconds,
+                "warning": str(exc), "test_only": True,
+            }
+        raise HTTPException(status_code=502, detail=f"闲鱼买家 SKU 接口调用失败：{exc}")
+    finally:
+        await api.close()
+
+    return {
+        "item_id": item_id,
+        "options": db_manager.list_delivery_sku_options(cookie_id, item_id),
+        "detection_status": "ok",
+        "test_only": True,
+    }
+
+@app.put("/api/anti-abuse/sku-configs/{item_id}")
+def save_delivery_sku_rules(item_id: str, cookie_id: str, payload: DeliverySkuRulesIn,
+                            current_user: Dict[str, Any] = Depends(get_current_user)):
+    if cookie_id not in db_manager.get_all_cookies(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="无权操作该闲鱼账号")
+    db_manager.save_delivery_sku_rules(cookie_id, item_id, [r.model_dump() if hasattr(r, 'model_dump') else r.dict() for r in payload.skus])
+    return {"success": True, "options": db_manager.list_delivery_sku_options(cookie_id, item_id)}
+
+@app.get("/api/anti-abuse/sku-blocks")
+def get_delivery_sku_blocks(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    if cookie_id not in db_manager.get_all_cookies(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="无权访问该闲鱼账号")
+    return {"blocks": db_manager.list_delivery_sku_blocks(cookie_id)}
+
 
 @app.get("/item-delivery-configs")
 def get_item_delivery_config_summaries(
@@ -5885,6 +6322,7 @@ class AIReplySettings(BaseModel):
     model_name: str = "qwen-plus"
     api_key: str = ""
     base_url: str = "https://ai.corleom.com/v1"
+    user_agent: str = ""
     max_discount_percent: int = 10
     max_discount_amount: int = 100
     max_bargain_rounds: int = 3
@@ -6455,6 +6893,79 @@ def get_user_setting(key: str, current_user: Dict[str, Any] = Depends(get_curren
 
 # ------------------------- 管理员专用接口 -------------------------
 
+class UserStatusIn(BaseModel):
+    is_active: bool
+
+
+class PasswordResetIn(BaseModel):
+    new_password: str
+
+
+def _revoke_user_tokens(user_id: int) -> int:
+    """吊销某用户的全部在线会话。禁用账号、重置密码后立即生效，防止旧 token 继续操作。"""
+    revoked = [token for token, data in SESSION_TOKENS.items() if data.get('user_id') == user_id]
+    for token in revoked:
+        SESSION_TOKENS.pop(token, None)
+    return len(revoked)
+
+
+@app.patch('/admin/users/{user_id}/status')
+def set_user_status(user_id: int, data: UserStatusIn, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """启用/禁用用户（管理员专用）"""
+    from app.db_manager import db_manager
+    try:
+        target = db_manager.get_user_by_id(user_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        # 内置管理员是系统最后一个管理入口，禁用它等于把后台锁死
+        if target['username'] == ADMIN_USERNAME:
+            raise HTTPException(status_code=400, detail="内置管理员不可禁用")
+
+        if not db_manager.set_user_active(user_id, data.is_active):
+            raise HTTPException(status_code=400, detail="状态更新失败")
+
+        # 禁用后踢掉在线会话；启用时也顺手清理（正常不会有残留）
+        revoked = _revoke_user_tokens(user_id)
+
+        action = '启用' if data.is_active else '禁用'
+        log_with_user('info', f"{action}用户 {target['username']}，吊销 {revoked} 个会话", admin_user)
+        return {"message": f"用户 {target['username']} 已{action}", "revoked_tokens": revoked}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"更新用户状态异常: {str(e)}", admin_user)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put('/admin/users/{user_id}/password')
+def reset_user_password(user_id: int, data: PasswordResetIn, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """重置用户密码（管理员专用）"""
+    from app.db_manager import db_manager
+    try:
+        target = db_manager.get_user_by_id(user_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        # 管理员自己的密码含当前会话身份校验，统一走「系统设置」的修改密码
+        if target['username'] == ADMIN_USERNAME:
+            raise HTTPException(status_code=400, detail="内置管理员的密码请在系统设置中修改")
+
+        valid, reason = validate_password(data.new_password)
+        if not valid:
+            raise HTTPException(status_code=400, detail=reason)
+
+        if not db_manager.update_user_password(target['username'], data.new_password):
+            raise HTTPException(status_code=400, detail="密码重置失败")
+
+        _revoke_user_tokens(user_id)
+        log_with_user('info', f"重置用户 {target['username']} 的密码", admin_user)
+        return {"message": f"用户 {target['username']} 的密码已重置，其所有会话已强制下线"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"重置用户密码异常: {str(e)}", admin_user)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get('/admin/users')
 def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
     """获取所有用户信息（管理员专用）"""
@@ -6499,12 +7010,17 @@ def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin
         if not user_to_delete:
             raise HTTPException(status_code=404, detail="用户不存在")
 
+        # 内置管理员是权限体系的根，删除后无人能进管理端
+        if user_to_delete['username'] == ADMIN_USERNAME:
+            raise HTTPException(status_code=400, detail="内置管理员不可删除")
+
         log_with_user('info', f"准备删除用户: {user_to_delete['username']} (ID: {user_id})", admin_user)
 
         # 删除用户及其相关数据
         success = db_manager.delete_user_and_data(user_id)
 
         if success:
+            _revoke_user_tokens(user_id)
             log_with_user('info', f"用户删除成功: {user_to_delete['username']} (ID: {user_id})", admin_user)
             return {"message": f"用户 {user_to_delete['username']} 删除成功"}
         else:
@@ -6752,20 +7268,20 @@ def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admi
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/admin/stats')
-def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
-    """获取系统统计信息（管理员专用）"""
+def get_system_stats(current_user: Dict[str, Any] = Depends(require_auth)):
+    """统计信息：管理员看全系统，普通用户只看自己名下的（总览页对两类用户都开放）"""
     from app.db_manager import db_manager
     try:
-        log_with_user('info', "查询系统统计信息", admin_user)
+        is_admin = current_user['username'] == ADMIN_USERNAME
+        log_with_user('info', "查询统计信息", current_user)
 
-        # 用户统计
-        all_users = db_manager.get_all_users()
-        total_users = len(all_users)
+        # 普通用户：total_users 不展示也无权限含义，给 0 占位保持字段结构一致
+        total_users = len(db_manager.get_all_users()) if is_admin else 0
 
-        # Cookie统计
-        all_cookies = db_manager.get_all_cookies()
+        # Cookie统计（按归属过滤）
+        all_cookies = db_manager.get_all_cookies(None if is_admin else current_user['user_id'])
         total_cookies = len(all_cookies)
-        
+
         # 活跃账号统计（启用状态的账号）
         active_cookies = 0
         for cookie_id in all_cookies.keys():
@@ -6773,21 +7289,24 @@ def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
             if status:
                 active_cookies += 1
 
-        # 卡券统计
-        all_cards = db_manager.get_all_cards()
+        # 卡券统计（按归属过滤）
+        all_cards = db_manager.get_all_cards(None if is_admin else current_user['user_id'])
         total_cards = len(all_cards) if all_cards else 0
 
-        # 关键词统计
-        all_keywords = db_manager.get_all_keywords()
+        # 关键词统计（按归属过滤）
+        all_keywords = db_manager.get_all_keywords(None if is_admin else current_user['user_id'])
         total_keywords = sum(len(kw_list) for kw_list in all_keywords.values())
 
-        # 订单统计
-        total_orders = 0
-        try:
-            orders = db_manager.get_all_orders()
-            total_orders = len(orders) if orders else 0
-        except:
-            pass
+        # 订单统计（管理员全量，普通用户按名下账号统计）
+        if is_admin:
+            total_orders = 0
+            try:
+                orders = db_manager.get_all_orders()
+                total_orders = len(orders) if orders else 0
+            except:
+                pass
+        else:
+            total_orders = db_manager.count_orders_by_user(current_user['user_id'])
 
         stats = {
             "total_users": total_users,
@@ -6798,11 +7317,11 @@ def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
             "total_orders": total_orders
         }
 
-        log_with_user('info', f"系统统计信息查询完成: {stats}", admin_user)
+        log_with_user('info', f"统计信息查询完成: {stats}", current_user)
         return stats
 
     except Exception as e:
-        log_with_user('error', f"获取系统统计信息失败: {str(e)}", admin_user)
+        log_with_user('error', f"获取系统统计信息失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------------- BI报表分析接口 -------------------------
@@ -7451,13 +7970,17 @@ def get_user_orders(
         all_orders = []
         # 各状态的全量计数，在状态筛选前累加
         status_counts: Dict[str, int] = {}
-        # 先获取所有商品的 item_id 到 item_title 的映射
+        # 先获取所有商品的 item_id 到 item_title/item_image 的映射
         item_titles = {}
+        item_images = {}
         with db_manager.lock:
             cursor = db_manager.conn.cursor()
-            cursor.execute('SELECT item_id, item_title FROM item_info')
+            cursor.execute('SELECT item_id, item_title, item_image FROM item_info')
             for row in cursor.fetchall():
-                item_titles[row[0]] = row[1]
+                if row[1]:
+                    item_titles[row[0]] = row[1]
+                if row[2]:
+                    item_images.setdefault(row[0], row[2])
 
         for cid in user_cookies.keys():
             orders = db_manager.get_orders_by_cookie(cid, limit=1000)
@@ -7465,6 +7988,8 @@ def get_user_orders(
                 order['cookie_id'] = cid
                 # 添加 item_title 字段
                 order['item_title'] = item_titles.get(order.get('item_id'), '')
+                # 添加 item_image 字段（订单表不存图片，从商品信息带出）
+                order['item_image'] = item_images.get(order.get('item_id'), '')
                 # 状态计数在筛选之前统计，保证各标签数字始终是全量口径
                 order_state = get_order_status(order)
                 status_counts[order_state] = status_counts.get(order_state, 0) + 1
@@ -7524,6 +8049,7 @@ async def get_seller_features(current_user: Dict[str, Any] = Depends(get_current
         'auto_rate_enabled': any(v['auto_rate_enabled'] for v in per_account.values()),
         'auto_flower_enabled': any(v['auto_flower_enabled'] for v in per_account.values()),
         'auto_thanks_enabled': any(v['auto_thanks_enabled'] for v in per_account.values()),
+        'auto_receive_flower_enabled': any(v['auto_receive_flower_enabled'] for v in per_account.values()),
         'auto_rate_template': _rate_template(),
     }
 
@@ -7532,6 +8058,7 @@ class BuyerInteractionUpdate(BaseModel):
     auto_rate_enabled: Optional[bool] = None
     auto_flower_enabled: Optional[bool] = None
     auto_thanks_enabled: Optional[bool] = None
+    auto_receive_flower_enabled: Optional[bool] = None
 
 
 @app.put('/api/seller-features/{cookie_id}')
@@ -7540,7 +8067,7 @@ async def update_seller_features(
     payload: BuyerInteractionUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """按账号更新评价/求花开关。"""
+    """按账号更新买家互动开关。"""
     from app.db_manager import db_manager
 
     if cookie_id not in (db_manager.get_all_cookies(current_user['user_id']) or {}):
@@ -7551,11 +8078,12 @@ async def update_seller_features(
         auto_rate_enabled=payload.auto_rate_enabled,
         auto_flower_enabled=payload.auto_flower_enabled,
         auto_thanks_enabled=payload.auto_thanks_enabled,
+        auto_receive_flower_enabled=payload.auto_receive_flower_enabled,
     )
     log_with_user(
         'info',
         f"更新账号 {cookie_id} 买家互动开关: rate={payload.auto_rate_enabled}, "
-        f"flower={payload.auto_flower_enabled}, thanks={payload.auto_thanks_enabled}",
+        f"flower={payload.auto_flower_enabled}, receive_flower={payload.auto_receive_flower_enabled}, thanks={payload.auto_thanks_enabled}",
         current_user
     )
     return {"success": True, **db_manager.get_buyer_interaction_settings(cookie_id)}
@@ -8350,30 +8878,23 @@ async def manual_ship_orders(
                     send_errors = []
                     for idx, content in enumerate(delivery_contents):
                         try:
-                            if content.startswith("__IMAGE_SEND__"):
-                                image_data = content.replace("__IMAGE_SEND__", "")
-                                card_id = None
-                                if "|" in image_data:
-                                    card_id_str, image_url = image_data.split("|", 1)
-                                    try:
-                                        card_id = int(card_id_str)
-                                    except ValueError:
-                                        card_id = None
-                                else:
-                                    image_url = image_data
-                                await live_instance.send_image_msg(
-                                    live_instance.ws, chat_id, buyer_id,
-                                    image_url, card_id=card_id
-                                )
-                            else:
-                                await live_instance.send_msg(
-                                    live_instance.ws, chat_id, buyer_id, content
-                                )
+                            segment_count = await send_delivery_payload(
+                                live_instance,
+                                live_instance.ws,
+                                chat_id,
+                                buyer_id,
+                                content,
+                            )
 
-                            # 多条消息之间间隔1秒
+                            # 多条卡券之间间隔1秒；单条卡券内的分段间隔由发送器控制
                             if len(delivery_contents) > 1 and idx < len(delivery_contents) - 1:
                                 await asyncio.sleep(1)
                             sent_count += 1
+                            log_with_user(
+                                'info',
+                                f"第{idx+1}条卡券已发送（{segment_count} 段消息）",
+                                current_user,
+                            )
                         except Exception as e:
                             log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
                             send_errors.append(f"第{idx + 1}条: {str(e)}")
@@ -8891,10 +9412,24 @@ async def start_manual_captcha(
             detail="该账号当前不处于风控状态，无需人工验证",
         )
 
-    timeout = max(60, min(int(timeout or 300), 900))
-    result = await open_manual_session(
-        cookie_id, user_cookies[cookie_id], timeout=timeout
-    )
+    # 暂停该账号的自动 Token 刷新/滑块循环。自动滑块和人工验证共用
+    # browser_limit 全局信号量（默认 3 槽位），自动滑块占满槽位后人工验证
+    # 会在 launch_browser 里等 300 秒超时，前端弹窗就卡在白屏 loading。
+    _instance = None
+    if cookie_manager.manager is not None:
+        _instance = cookie_manager.manager.instances.get(cookie_id)
+        if _instance is not None:
+            _instance.manual_captcha_in_progress = True
+            log_with_user('info', f"账号 {cookie_id} 已暂停自动验证，等待人工完成", current_user)
+
+    try:
+        timeout = max(60, min(int(timeout or 300), 900))
+        result = await open_manual_session(
+            cookie_id, user_cookies[cookie_id], timeout=timeout
+        )
+    finally:
+        if _instance is not None:
+            _instance.manual_captcha_in_progress = False
 
     if result['success']:
         # 拿到 x5sec 后必须清掉 x5secdata 等挑战标记，否则闲鱼会认为验证仍未完成，
@@ -9009,10 +9544,7 @@ async def get_fresh_captcha_url(
     headers = {
         'accept': 'application/json',
         'content-type': 'application/x-www-form-urlencoded',
-        'user-agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-            '(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
-        ),
+        'user-agent': CHROME_UA,
         'referer': 'https://www.goofish.com/',
         'origin': 'https://www.goofish.com',
         'cookie': cookies_str,
@@ -9043,6 +9575,11 @@ async def get_fresh_captcha_url(
     url = data.get('url') or ''
     if url and ('punish' in url or 'action=captcha' in url):
         log_with_user('info', f'账号 {cookie_id} 已取得新的验证链接', current_user)
+        # 用户马上要去浏览器手动过滑块：提前解除熔断，让心跳恢复令牌探测。
+        # 否则滑块验证通过了，服务端仍按冷却期拒绝一切请求，账号卡片上的
+        # 「滑块验证 · N 分钟」要干等冷却自然到期才消失 —— 看起来就像验证白做了。
+        from utils import risk_control
+        risk_control.registry.get(cookie_id).reset()
         return {
             'success': True,
             'need_verify': True,
@@ -9308,6 +9845,31 @@ async def require_order_flower(
         await api.close()
 
 
+@app.post('/api/orders/{order_id}/receive-flower')
+async def receive_order_flower(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """收下买家赠送的小红花，需按账号开启自动收花开关。"""
+    from app.db_manager import db_manager
+    from utils.xianyu_seller_api import XianyuSellerAPI, SellerApiError
+
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    cid, cookies_str = _resolve_order_cookie(order_id, user_cookies)
+    if not db_manager.get_buyer_interaction_settings(cid)['auto_receive_flower_enabled']:
+        raise HTTPException(status_code=403, detail="该账号未开启自动收下小红花功能")
+    api = XianyuSellerAPI(cid, cookies_str)
+    try:
+        data = await api.receive_flower(order_id)
+        log_with_user('info', f'订单 {order_id} 已收下小红花', current_user)
+        return JSONResponse({'success': True, 'data': data})
+    except SellerApiError as exc:
+        log_with_user('warning', f'订单 {order_id} 收花失败: {exc}', current_user)
+        return JSONResponse({'success': False, 'message': str(exc)}, status_code=502)
+    finally:
+        await api.close()
+
+
 @app.post('/api/orders/rate')
 async def rate_orders(
     order_ids: str = Form(...),
@@ -9365,17 +9927,20 @@ async def rate_orders(
         await api.close()
 
 
-@app.get('/{path:path}', response_class=HTMLResponse)
-async def catch_all_route(path: str):
+@app.api_route(
+    '/{path:path}',
+    methods=['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    response_class=HTMLResponse,
+)
+async def catch_all_route(path: str, request: Request):
     """
-    Catch-all 路由：处理所有未匹配的 GET 请求
-    如果是 API 请求，返回 404；否则返回前端 index.html
+    Catch-all 路由：处理所有未匹配的请求
+    未匹配的 API 路径与非 GET 请求返回 404，浏览器 GET 前端路由返回 index.html
     """
-    full_path = f'/{path}'
     root_segment = path.split('/', 1)[0]
-    if root_segment in API_ROOTS:
+    if root_segment in API_ROOTS or request.method not in ('GET', 'HEAD'):
         raise HTTPException(status_code=404, detail="Not Found")
-    
+
     # 返回前端页面
     return await serve_frontend()
 

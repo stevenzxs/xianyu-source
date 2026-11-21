@@ -25,6 +25,8 @@ export interface LoginResponse {
   user_id?: number;
   username?: string;
   is_admin?: boolean;
+  /** true 表示连续登录失败已达阈值，下一次登录必须携带图形验证码 */
+  captcha_required?: boolean;
 }
 
 // Accounts
@@ -128,8 +130,25 @@ export interface Card {
   image_url?: string;
   // 通用配置
   delay_seconds?: number;
+  // 发货详情文案：开关、文案内容（{参数}/{分隔符}/{图片N}）、图片映射（N -> url）
+  delivery_template?: string;
+  delivery_template_enabled?: boolean;
+  delivery_template_images?: Record<string, string>;
   created_at: string;
   updated_at: string;
+}
+
+/** 批量卡密每发出一行生成一条已发货记录。 */
+export interface CardShipment {
+  id: number;
+  card_id?: number;
+  card_name: string;
+  content: string;
+  order_id: string;
+  item_id: string;
+  buyer_id: string;
+  cookie_id: string;
+  shipped_at: string;
 }
 
 // Items
@@ -359,7 +378,24 @@ export interface MessageNotification {
   channel_id: number;
   channel_name: string;
   channel_type?: NotificationChannelType;
+  channel_enabled?: boolean;
+  name?: string | null;
+  event_types?: string[] | null;
   enabled: boolean;
+}
+
+export type NotificationPriority = 'critical' | 'warning' | 'info';
+
+export interface NotificationEventDefinition {
+  id: string;
+  label: string;
+  priority: NotificationPriority;
+  description: string;
+}
+
+export interface NotificationPriorityDefinition {
+  id: NotificationPriority;
+  label: string;
 }
 
 export interface RiskControlLog {
@@ -467,6 +503,18 @@ export interface AdminStats {
   total_orders: number;
 }
 
+// 用户管理（管理员专用）。内置 admin 是唯一管理员，其余注册用户均为普通用户。
+export interface AdminUser {
+  id: number;
+  username: string;
+  email: string;
+  is_active?: boolean;
+  cookie_count?: number;
+  card_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface OrderAnalytics {
   revenue_stats: {
     total_amount: number;
@@ -537,6 +585,7 @@ export interface AIReplySettings {
   api_key: string;
   api_key_configured?: boolean;
   base_url: string;
+  user_agent?: string;
   max_discount_percent: number;
   max_discount_amount?: number;
   max_bargain_rounds: number;

@@ -1,14 +1,18 @@
 # 闲鱼智控（闲鱼超级管家）
 
 面向闲鱼卖家的账号、商品、订单、消息、自动回复与自动发货一体化管理系统。
+*一款能让你的想法'变现'的强大作品* 
+### 推荐使用云端版（GPT6自动过滑块+人工巡检）
+云端saas版本：https://xy.corleom.com/
+**本项目征集PR、功能更新，任何一个提交PR的作者会在未来获得顶配模型token奖励**
 
 [![GitHub Stars](https://img.shields.io/github/stars/23Star/xianyu-super-butler?style=flat&logo=github&color=f5b301)](https://github.com/23Star/xianyu-super-butler/stargazers)
-[![Version](https://img.shields.io/badge/Version-3.1.0-52c41a)](https://github.com/23Star/xianyu-super-butler/releases)
+[![Version](https://img.shields.io/badge/Version-3.3.0-52c41a)](https://github.com/23Star/xianyu-super-butler/releases)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-222222)](LICENSE)
 
-**一个人，把几十个闲鱼账号做成一门自动运转的生意。**
+**一个人把多个闲鱼账号做成一门自动运转的生意，让你的创意自动'变现'**
 
 多账号统一托管，买家下单自动发卡密、自动确认收货、自动评价、自动求小红花、收货后自动致谢。
 关键词和 AI 双层自动回复接住每一句咨询，商品与订单自动同步，滑块与人机验证自动处理。
@@ -80,6 +84,13 @@
 ![消息中心](docs/screenshots/message-center.png)
 
 ## 如何部署
+
+> **⚠️ 请勿部署到 Hugging Face Spaces 等共享托管平台**
+>
+> 本项目内置反检测浏览器（Patchright）、验证码处理（CAPTCHA/Geetest）与 Telegram 通知等组件，
+> 这类组合极易被共享平台判定为滥用（platform abuse），已有多起导致账号被封、其他 Space 受牵连的先例。
+> 此外，海外出口 IP 也会显著增加闲鱼自有风控的触发概率。
+> **推荐部署到本地设备、自有 VPS 或国内服务器。**
 
 ### 一条命令直接启动（最快，不用克隆仓库）
 

@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AdminStats, OrderAnalytics, Order, OrderStatus, Item } from '../types';
 import { getAdminStats, getOrderAnalytics, getValidOrders, getItems } from '../services/api';
+import { notify } from '../services/feedback';
 import {TrendingUp, Users, ShoppingCart, AlertCircle, DollarSign, Activity, Package, BarChart3, PackageCheck, ExternalLink, RefreshCw} from 'lucide-react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell, Legend } from 'recharts';
 import { EmptyState, PageHeader, PageLoading, PageTabs, SectionHeader } from './ui';
@@ -36,7 +37,7 @@ const StatCard: React.FC<{ title: string; value: string | number; icon: React.El
   <div className="metric-card">
     <div className="flex items-start justify-between gap-3">
       <span className={`flex h-9 w-9 items-center justify-center rounded-md ${colorClass}`}>
-        <Icon className="h-4 w-4 text-white" />
+        <Icon className="h-4 w-4 text-[var(--brand-ink)]" />
       </span>
       {trend && <span className="status-badge status-badge-success flex items-center gap-1">
         <TrendingUp className="w-3 h-3" /> {trend}
@@ -52,6 +53,8 @@ type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom'
 const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [analytics, setAnalytics] = useState<OrderAnalytics | null>(null);
+  // analytics 是否已成功加载过：切换时间范围失败时，靠它区分「整页错误」还是「保留旧图提示」
+  const analyticsRef = useRef(false);
   const [timeRange, setTimeRange] = useState<TimeRange>('7days');
   const [customStartDate, setCustomStartDate] = useState('');
   const [customEndDate, setCustomEndDate] = useState('');
@@ -189,6 +192,7 @@ const Dashboard: React.FC = () => {
     ]);
     setAnalytics(currentAnalytics);
     setPreviousAnalytics(previousPeriodAnalytics);
+    analyticsRef.current = true;
   };
 
   // 获取上一个时间段的参数
@@ -261,10 +265,11 @@ const Dashboard: React.FC = () => {
     return `${sign}${percent.toFixed(1)}%`;
   };
 
+  // 统计与商品列表：只在进页/手动刷新时加载，切时间范围不重拉
   useEffect(() => {
     let cancelled = false;
 
-    const loadDashboard = async () => {
+    const loadBase = async () => {
       setDashboardLoading(true);
       setDashboardError(null);
 
@@ -272,7 +277,6 @@ const Dashboard: React.FC = () => {
         const [statsData, itemData] = await Promise.all([
           getAdminStats(),
           getItems(),
-          loadAnalytics(timeRange),
         ]);
 
         if (cancelled) return;
@@ -294,7 +298,32 @@ const Dashboard: React.FC = () => {
       }
     };
 
-    void loadDashboard();
+    void loadBase();
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadToken]);
+
+  // 订单分析：随时间范围切换重拉；期间保留旧图，不再整页转圈
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadRange = async () => {
+      try {
+        await loadAnalytics(timeRange);
+      } catch (error) {
+        if (cancelled) return;
+        console.error('加载订单分析失败:', error);
+        // 首次加载失败没有旧数据可显示，走整页错误；切换失败则保留旧图并提示
+        if (!analyticsRef.current) {
+          setDashboardError(error instanceof Error ? error.message : '订单分析加载失败');
+        } else {
+          notify('订单分析刷新失败，仍显示上一时间范围的数据', 'error');
+        }
+      }
+    };
+
+    void loadRange();
     return () => {
       cancelled = true;
     };
@@ -334,11 +363,12 @@ const Dashboard: React.FC = () => {
     return { startDate, endDate };
   };
 
-  if (dashboardLoading) {
+  // 首次加载：基础数据或订单分析任一未就绪都显示整页 loading；切换时间范围时 analytics 保留旧值，不进这里
+  if (dashboardLoading || !stats || !analytics) {
     return <PageLoading label="正在汇总经营数据" />;
   }
 
-  if (dashboardError || !stats || !analytics) {
+  if (dashboardError) {
     return (
       <div className="p-4 sm:p-8">
         <div className="section-panel mx-auto max-w-xl border-red-200 bg-red-50 p-5">
@@ -539,32 +569,32 @@ const Dashboard: React.FC = () => {
                 barGap={6}
                 barCategoryGap="28%"
               >
-                <CartesianGrid vertical={false} stroke="#ebe9e3" strokeDasharray="4 4" />
+                <CartesianGrid vertical={false} stroke="var(--chart-grid)" strokeDasharray="4 4" />
                 <XAxis
                   dataKey="name"
                   axisLine={false}
                   tickLine={false}
-                  tick={{fill: '#66625c', fontSize: 12, fontWeight: 600}}
+                  tick={{fill: 'var(--text-muted)', fontSize: 12, fontWeight: 600}}
                   dy={10}
                   interval="preserveStartEnd"
                 />
                 <YAxis
                   axisLine={false}
                   tickLine={false}
-                  tick={{fill: '#b0aaa0', fontSize: 12, fontWeight: 500}}
+                  tick={{fill: 'var(--text-soft)', fontSize: 12, fontWeight: 500}}
                   tickFormatter={(value) => `¥${value}`}
                 />
                 <Tooltip
                   contentStyle={{
-                    backgroundColor: '#ffffff',
+                    backgroundColor: 'var(--surface)',
                     borderRadius: '14px',
-                    border: '1px solid #ebe9e3',
-                    boxShadow: '0 8px 24px rgba(122, 96, 20, 0.12)',
+                    border: '1px solid var(--border)',
+                    boxShadow: 'var(--shadow-md)',
                     padding: '10px 14px'
                   }}
-                  itemStyle={{ color: '#2a2416', fontWeight: 600 }}
-                  labelStyle={{ color: '#66625c', fontWeight: 600, marginBottom: 4 }}
-                  cursor={{ fill: 'rgba(255, 225, 0, 0.12)', radius: 8 }}
+                  itemStyle={{ color: 'var(--text)', fontWeight: 600 }}
+                  labelStyle={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 4 }}
+                  cursor={{ fill: 'var(--chart-cursor)', radius: 8 }}
                   formatter={(value, name) => {
                     const label = name === 'confirmed' ? '已到账' : '成交额';
                     return [`¥${Number(value).toFixed(2)}`, label];
@@ -576,7 +606,7 @@ const Dashboard: React.FC = () => {
                   iconType="circle"
                   iconSize={8}
                   formatter={(value) => (
-                    <span style={{ color: '#66625c', fontSize: 12 }}>
+                    <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
                       {value === 'confirmed' ? '已到账' : '成交额'}
                     </span>
                   )}
@@ -602,30 +632,32 @@ const Dashboard: React.FC = () => {
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={productSalesData} layout="vertical" barCategoryGap="30%">
-                  <CartesianGrid strokeDasharray="4 4" horizontal={true} vertical={false} stroke="#ebe9e3" />
+                  <CartesianGrid strokeDasharray="4 4" horizontal={true} vertical={false} stroke="var(--chart-grid)" />
                   <XAxis
                     type="number"
                     axisLine={false}
                     tickLine={false}
-                    tick={{ fill: '#b0aaa0', fontSize: 12 }}
+                    tick={{ fill: 'var(--text-soft)', fontSize: 12 }}
                   />
                   <YAxis
                     type="category"
                     dataKey="name"
                     axisLine={false}
                     tickLine={false}
-                    tick={{ fill: '#66625c', fontSize: 12 }}
+                    tick={{ fill: 'var(--text-muted)', fontSize: 12 }}
                     width={100}
                   />
                   <Tooltip
                     contentStyle={{
-                      backgroundColor: '#fff',
-                      border: '1px solid #ebe9e3',
+                      backgroundColor: 'var(--surface)',
+                      border: '1px solid var(--border)',
                       borderRadius: '14px',
-                      boxShadow: '0 8px 24px rgba(122, 96, 20, 0.12)',
+                      boxShadow: 'var(--shadow-md)',
                       padding: '10px 14px'
                     }}
-                    cursor={{ fill: 'rgba(255, 225, 0, 0.12)', radius: 8 }}
+                    itemStyle={{ color: 'var(--text)', fontWeight: 600 }}
+                    labelStyle={{ color: 'var(--text-muted)', fontWeight: 600 }}
+                    cursor={{ fill: 'var(--chart-cursor)', radius: 8 }}
                   />
                   {/* 同上：商品只有一两个时不限宽会变成超粗横条 */}
                   <Bar dataKey="sales" fill="#ffd426" radius={[0, 8, 8, 0]} maxBarSize={28} />
@@ -666,25 +698,26 @@ const Dashboard: React.FC = () => {
                     activeShape={{ outerRadius: 98 }}
                   >
                     {sourceDataData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} stroke="#ffffff" strokeWidth={2} />
+                      <Cell key={`cell-${index}`} fill={entry.color} stroke="var(--surface)" strokeWidth={2} />
                     ))}
                   </Pie>
                   <Tooltip
                     contentStyle={{
-                      backgroundColor: '#ffffff',
-                      border: '1px solid #e9e7e2',
+                      backgroundColor: 'var(--surface)',
+                      border: '1px solid var(--border)',
                       borderRadius: '14px',
-                      boxShadow: '0 8px 24px rgba(35, 33, 30, 0.10)',
+                      boxShadow: 'var(--shadow-md)',
                       padding: '10px 14px'
                     }}
-                    itemStyle={{ color: '#23211e', fontWeight: 600 }}
+                    itemStyle={{ color: 'var(--text)', fontWeight: 600 }}
+                    labelStyle={{ color: 'var(--text-muted)', fontWeight: 600 }}
                     formatter={(value, name) => [`${value} 单`, name]}
                   />
                   <Legend
                     verticalAlign="bottom"
                     height={36}
                     iconType="circle"
-                    formatter={(value) => <span style={{ color: '#6b6862', fontWeight: 500 }}>{value}</span>}
+                    formatter={(value) => <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>{value}</span>}
                   />
                 </PieChart>
               </ResponsiveContainer>
@@ -724,7 +757,7 @@ const Dashboard: React.FC = () => {
                 暂无订单数据
               </div>
             ) : (
-              <table className="data-table min-w-[760px]">
+              <table className="data-table responsive-data-table min-w-[760px]">
                 <thead>
                   <tr>
                     <th>订单信息</th>
@@ -743,10 +776,10 @@ const Dashboard: React.FC = () => {
                     )
                     .map((order) => (
                       <tr key={order.order_id}>
-                        <td>
+                        <td data-label="订单信息">
                           <div className="flex items-center gap-3">
                             <div className="h-11 w-11 flex-shrink-0 overflow-hidden rounded-md border border-gray-100 bg-gray-100">
-                              <PackageCheck className="w-full h-full text-gray-300 p-2" />
+                              <PackageCheck className="w-full h-full text-gray-400 p-2" />
                             </div>
                             <div className="min-w-0">
                               <div className="font-bold text-gray-900 text-sm line-clamp-1">
@@ -757,19 +790,19 @@ const Dashboard: React.FC = () => {
                             </div>
                           </div>
                         </td>
-                        <td>
+                        <td data-label="买家信息">
                           <div className="text-sm font-bold text-gray-800">{order.buyer_id}</div>
                           {order.created_at && (
                             <div className="text-xs text-gray-400 mt-1">{order.created_at}</div>
                           )}
                         </td>
-                        <td className="text-sm font-extrabold text-gray-900 font-feature-settings-tnum">
+                        <td className="text-sm font-extrabold text-gray-900 font-feature-settings-tnum" data-label="金额">
                           ¥{order.amount || '0.00'}
                         </td>
-                        <td>
+                        <td data-label="状态">
                           <StatusBadge status={order.status || order.order_status || 'unknown'} />
                         </td>
-                        <td className="text-right">
+                        <td className="text-right" data-label="操作">
                           <a
                             href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`}
                             target="_blank"
@@ -810,18 +843,19 @@ const Dashboard: React.FC = () => {
                       activeShape={{ outerRadius: 108 }}
                     >
                       {categoryDataData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={entry.color || COLORS[index % COLORS.length]} stroke="#ffffff" strokeWidth={2} />
+                        <Cell key={`cell-${index}`} fill={entry.color || COLORS[index % COLORS.length]} stroke="var(--surface)" strokeWidth={2} />
                       ))}
                     </Pie>
                     <Tooltip
                       contentStyle={{
-                        backgroundColor: '#fff',
-                        border: '1px solid #e9e7e2',
+                        backgroundColor: 'var(--surface)',
+                        border: '1px solid var(--border)',
                         borderRadius: '14px',
-                        boxShadow: '0 8px 24px rgba(35, 33, 30, 0.10)',
+                        boxShadow: 'var(--shadow-md)',
                         padding: '10px 14px'
                       }}
-                      itemStyle={{ color: '#23211e', fontWeight: 600 }}
+                      itemStyle={{ color: 'var(--text)', fontWeight: 600 }}
+                      labelStyle={{ color: 'var(--text-muted)', fontWeight: 600 }}
                       formatter={(value: number) => `¥${value.toLocaleString()}`}
                     />
                   </PieChart>
